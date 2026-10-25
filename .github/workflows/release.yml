@@ -1,0 +1,105 @@
+name: Release
+
+# Push a tag like v0.2.0 → build every platform, pack with Velopack (delta against the previous release),
+# publish one GitHub Release with release notes generated from the commits since the last tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  VPK_VERSION: 1.2.161 # keep in step with the velopack crate in src-tauri/Cargo.toml
+  PACK_ID: PersonalDownloader
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin, channel: osx-arm64 }
+          - { os: macos-14, target: x86_64-apple-darwin, channel: osx-x64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, channel: win-x64 }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, channel: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
+      - name: Rust target (toolchain from rust-toolchain.toml)
+        working-directory: src-tauri
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Bundled tools (yt-dlp, ffmpeg, deno)
+        run: scripts/fetch-bins.sh ${{ matrix.target }}
+      - name: Build
+        run: npx tauri build --target ${{ matrix.target }} ${{ runner.os == 'macOS' && '--bundles app' || '--no-bundle' }} --config "{\"version\":\"$VERSION\"}"
+      - name: Stage pack dir
+        run: |
+          out=src-tauri/target/${{ matrix.target }}/release
+          case "$RUNNER_OS" in
+            macOS) pack="$out/bundle/macos/Personal Downloader.app"; exe=personal-downloader; icon=src-tauri/icons/icon.icns ;;
+            Windows) exe=personal-downloader.exe; icon=src-tauri/icons/icon.ico ;;
+            Linux) exe=personal-downloader; icon=src-tauri/icons/icon.png ;;
+          esac
+          if [ "$RUNNER_OS" != macOS ]; then
+            # no Tauri bundle here, so put the resources next to the exe, where the app also looks for them
+            pack=pack; mkdir -p pack; cp "$out/$exe" pack/; cp -R src-tauri/resources pack/
+          fi
+          { echo "PACK=$pack"; echo "EXE=$exe"; echo "ICON=$icon"; } >> "$GITHUB_ENV"
+      - name: Pack with Velopack
+        env:
+          GH_REPO_URL: https://github.com/${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dotnet tool install -g vpk --version "$VPK_VERSION"
+          scripts/changelog.sh "$GITHUB_REF_NAME" "${{ github.repository }}" > notes.md
+          # the previous full package is the base for this release's delta; none exists before the first release
+          vpk download github --repoUrl "$GH_REPO_URL" --channel ${{ matrix.channel }} --token "$TOKEN" || true
+          vpk pack -u "$PACK_ID" -v "$VERSION" -p "$PACK" -e "$EXE" -i "$ICON" --channel ${{ matrix.channel }} \
+            --packTitle "Personal Downloader" --releaseNotes notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.channel }}
+          path: Releases
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Upload to one GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO_URL: https://github.com/${{ github.repository }}
+        run: |
+          dotnet tool install -g vpk --version "$VPK_VERSION"
+          for ch in linux-x64 win-x64 osx-arm64 osx-x64; do
+            vpk upload github -o "dist/$ch" --channel "$ch" --repoUrl "$GH_REPO_URL" --token "$GH_TOKEN" \
+              --publish --merge --tag "$GITHUB_REF_NAME" --releaseName "Personal Downloader ${GITHUB_REF_NAME#v}"
+          done
+          scripts/changelog.sh "$GITHUB_REF_NAME" "${{ github.repository }}" > notes.md
+          gh release edit "$GITHUB_REF_NAME" --notes-file notes.md

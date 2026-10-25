@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>Personal Downloader</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <header class="toolbar" data-tauri-drag-region>
+      <nav class="tabs" role="tablist" aria-label="Pages">
+        <button role="tab" type="button" data-page="download" aria-selected="true">Download</button>
+        <button role="tab" type="button" data-page="library" aria-selected="false">Library<span class="badge nums" id="badge"></span></button>
+        <button role="tab" type="button" data-page="settings" aria-selected="false">Settings</button>
+      </nav>
+    </header>
+
+    <main class="page" id="download" role="tabpanel">
+      <form class="intake card" id="intake" autocomplete="off">
+        <label class="sr" for="link">Link</label>
+        <input id="link" name="link" dir="auto" placeholder="Paste a link" autofocus spellcheck="false" />
+        <button class="key" type="submit" id="fetch">Fetch</button>
+      </form>
+      <p class="error" id="error" dir="auto" role="alert" hidden></p>
+
+      <button class="strip card" type="button" id="strip" hidden></button>
+
+      <form class="pick card" id="pick" hidden></form>
+
+      <section id="recent" hidden>
+        <h2 class="section">Recent <button class="link-btn" type="button" id="see-all">See all ›</button></h2>
+        <ul class="list card" id="recent-list" aria-label="Recent downloads"></ul>
+      </section>
+      <p class="hint" id="hint" hidden>Paste a link from YouTube, Instagram, X, SoundCloud… and pick a quality.</p>
+    </main>
+
+    <main class="page" id="library" role="tabpanel" hidden>
+      <section id="downloads" hidden>
+        <h2 class="section">In progress</h2>
+        <ul class="list card" id="queue"></ul>
+      </section>
+      <section>
+        <h2 class="section">History
+          <input class="search" id="search" type="search" dir="auto" placeholder="Search" aria-label="Search history" spellcheck="false" />
+          <button class="link-btn" type="button" id="clear">Clear</button>
+        </h2>
+        <ul class="list card" id="history"></ul>
+      </section>
+    </main>
+
+    <main class="page" id="settings" role="tabpanel" hidden>
+      <h2 class="section">Downloads</h2>
+      <div class="group card">
+        <div class="setting">
+          <span>Save to</span>
+          <b class="folder-path" id="dir" dir="auto"></b>
+          <button class="btn" type="button" id="dir-btn">Change</button>
+        </div>
+      </div>
+      <h2 class="section">yt-dlp</h2>
+      <div class="group card">
+        <div class="setting">
+          <span><span class="nums" id="ytdlp-ver">yt-dlp</span><small id="status">Checking…</small></span>
+          <button class="btn" type="button" id="check" hidden>Check now</button>
+          <button class="btn primary" type="button" id="use-builtin" hidden>Use built-in yt-dlp</button>
+        </div>
+        <label class="setting"><span>Update channel<small>Nightly fixes site breakages sooner</small></span>
+          <select id="channel"><option value="stable">Stable</option><option value="nightly">Nightly</option></select>
+        </label>
+      </div>
+      <h2 class="section">About</h2>
+      <div class="group card">
+        <div class="setting">
+          <span><span class="nums" id="about">Personal Downloader</span><small id="app-status">GPL-3.0</small></span>
+          <button class="btn" type="button" id="app-check">Check for updates</button>
+          <button class="btn primary" type="button" id="restart" hidden>Restart to update</button>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>
