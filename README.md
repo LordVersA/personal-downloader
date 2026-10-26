@@ -20,6 +20,7 @@ A clean desktop app (yt-dlp GUI) for YouTube, Instagram, X/Twitter, SoundCloud, 
 ## Features
 
 - **Paste and pick**: every resolution up to 4K/8K with codec, fps, HDR, bitrate and size shown up front.
+- **Playlists and channels**: search and pick the videos you want, one quality for all, saved in a folder per playlist.
 - **Any output format**: MP4, MKV, WebM or MOV video; MP3, M4A, Opus, FLAC or WAV audio.
 - **Music ready**: square cover art and full tags (title, artist, album, date) on every audio download.
 - **Signed-in downloads**: import cookies from Chrome, Firefox, Safari, Edge or Brave for private, age-restricted or members-only content.
