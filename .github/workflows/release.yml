@@ -65,6 +65,9 @@ jobs:
             pack=pack; mkdir -p pack; cp "$out/$exe" pack/; cp -R src-tauri/resources pack/
           fi
           { echo "PACK=$pack"; echo "EXE=$exe"; echo "ICON=$icon"; } >> "$GITHUB_ENV"
+      - uses: actions/setup-dotnet@v4 # vpk runs on .NET 10
+        with:
+          dotnet-version: 10.0.x
       - name: Pack with Velopack
         env:
           GH_REPO_URL: https://github.com/${{ github.repository }}
@@ -91,6 +94,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+      - uses: actions/setup-dotnet@v4 # vpk runs on .NET 10
+        with:
+          dotnet-version: 10.0.x
       - name: Upload to one GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

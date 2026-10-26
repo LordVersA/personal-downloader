@@ -48,7 +48,8 @@ case "$target" in
 esac
 
 deno=https://github.com/denoland/deno/releases/latest/download/deno-$target.zip
-fetch "$deno" "$tmp/deno.zip" "$(curl -fsSL "$deno.sha256sum" | cut -d' ' -f1)"
+# the Windows .sha256sum is PowerShell Get-FileHash output (uppercase), so pull out the bare hash
+fetch "$deno" "$tmp/deno.zip" "$(curl -fsSL "$deno.sha256sum" | grep -oE '[0-9A-Fa-f]{64}' | head -1 | tr A-F a-f)"
 unzip -o -q "$tmp/deno.zip" -d "$out"
 chmod +x "$out"/*
 ls -la "$out"
