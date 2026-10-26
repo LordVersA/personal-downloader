@@ -67,6 +67,22 @@ jobs:
             pack=pack; mkdir -p pack; cp "$out/$exe" pack/
           fi
           { echo "PACK=$pack"; echo "EXE=$exe"; echo "ICON=$icon"; } >> "$GITHUB_ENV"
+      # Self-signed, so macOS still warns on first launch, but every release has the same signing identity:
+      # permissions like Full Disk Access survive updates (ad-hoc signatures change with every build, and macOS drops them)
+      - name: Signing keychain
+        if: runner.os == 'macOS'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/sign.keychain-db"; pw=$(uuidgen)
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" > /dev/null
+          rm "$RUNNER_TEMP/cert.p12"
       - uses: actions/setup-dotnet@v4 # vpk runs on .NET 10
         with:
           dotnet-version: 10.0.x
@@ -79,8 +95,10 @@ jobs:
           scripts/changelog.sh "$GITHUB_REF_NAME" "${{ github.repository }}" > notes.md
           # the previous full package is the base for this release's delta; none exists before the first release
           vpk download github --repoUrl "$GH_REPO_URL" --channel ${{ matrix.channel }} --token "$TOKEN" || true
+          sign=()
+          [ "$RUNNER_OS" = macOS ] && sign=(--signAppIdentity "Personal Downloader" --keychain "$RUNNER_TEMP/sign.keychain-db")
           vpk pack -u "$PACK_ID" -v "$VERSION" -p "$PACK" -e "$EXE" -i "$ICON" --channel ${{ matrix.channel }} \
-            --packTitle "Personal Downloader" --releaseNotes notes.md
+            --packTitle "Personal Downloader" --releaseNotes notes.md "${sign[@]}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.channel }}
