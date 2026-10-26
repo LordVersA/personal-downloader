@@ -189,10 +189,13 @@ fn cookies_file(app: &AppHandle) -> PathBuf {
 async fn import_cookies(app: AppHandle, browser: String) -> Result<String, String> {
     let (to, tmp) = (cookies_file(&app), cookies_file(&app).with_extension("txt.part"));
     let _ = std::fs::remove_file(&tmp);
-    // owner-only before yt-dlp writes login sessions into it; the mode survives its truncating writes and the rename
+    // owner-only before yt-dlp writes login sessions into it; the mode survives its truncating writes and the rename.
+    // yt-dlp also loads the file first, and rejects one without the Netscape header
+    let mut f = std::fs::OpenOptions::new();
+    f.write(true).create(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(std::fs::OpenOptions::new().write(true).create(true), 0o600)
-        .open(&tmp)
+    std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
+    std::io::Write::write_all(&mut f.open(&tmp).map_err(|e| e.to_string())?, b"# Netscape HTTP Cookie File\n")
         .map_err(|e| e.to_string())?;
     let o = ytdlp(&app).args(["--cookies-from-browser", &browser, "--cookies"]).arg(&tmp).output().map_err(start_err)?;
     let n = std::fs::read_to_string(&tmp).map(|t| t.lines().filter(|l| !l.is_empty() && !l.starts_with("# ")).count()).unwrap_or(0);
@@ -213,6 +216,43 @@ async fn import_cookies(app: AppHandle, browser: String) -> Result<String, Strin
     }
     std::fs::rename(&tmp, &to).map_err(|e| e.to_string())?;
     Ok(format!("{n} cookies from {browser}"))
+}
+
+// Main domain of a cookie line ("#HttpOnly_.www.youtube.com\t…" → ("youtube.com", "youtube")); handles two-part suffixes like co.uk
+fn cookie_domain(line: &str) -> Option<(String, String)> {
+    let host = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+    if host.starts_with('#') {
+        return None;
+    }
+    let labels: Vec<&str> = host.split('\t').next()?.trim_start_matches('.').split('.').filter(|l| !l.is_empty()).collect();
+    let n = labels.len();
+    let k = if n >= 3 && ["co", "com", "org", "net", "ac", "gov", "edu"].contains(&labels[n - 2]) { 3 } else { 2 };
+    if n < k {
+        return None;
+    }
+    Some((labels[n - k..].join("."), labels[n - k].to_ascii_lowercase()))
+}
+
+// Sites in the imported cookies that yt-dlp has an extractor for, matched by name (x.com is yt-dlp's "twitter")
+#[tauri::command]
+async fn cookie_sites(app: AppHandle) -> Result<Vec<String>, String> {
+    let Ok(text) = std::fs::read_to_string(cookies_file(&app)) else { return Ok(vec![]) };
+    let o = ytdlp(&app).arg("--list-extractors").output().map_err(start_err)?;
+    let names: std::collections::HashSet<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(|l| {
+            l.split(':').next().unwrap_or_default().chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase()
+        })
+        .collect();
+    let mut sites: Vec<String> = text
+        .lines()
+        .filter_map(cookie_domain)
+        .filter(|(_, name)| names.contains(if name == "x" { "twitter" } else { name }))
+        .map(|(domain, _)| domain)
+        .collect();
+    sites.sort();
+    sites.dedup();
+    Ok(sites)
 }
 
 #[tauri::command]
@@ -571,6 +611,7 @@ pub fn run() {
             install_tools,
             list_sites,
             import_cookies,
+            cookie_sites,
             remove_cookies,
             test_proxy,
             check_app_update,
@@ -592,6 +633,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_domains() {
+        assert_eq!(cookie_domain("#HttpOnly_.www.youtube.com\tTRUE\t/"), Some(("youtube.com".into(), "youtube".into())));
+        assert_eq!(cookie_domain(".bbc.co.uk\tTRUE\t/"), Some(("bbc.co.uk".into(), "bbc".into())));
+        assert_eq!(cookie_domain("# Netscape HTTP Cookie File"), None);
+    }
 
     #[test]
     fn explains_errors() {

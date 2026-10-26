@@ -218,6 +218,8 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .stats { display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: 12px; color: var(--label-2); }
 .stats b { font-size: 15px; font-weight: 600; color: var(--label); letter-spacing: -0.01em; margin-right: 2px; }
 .facts { display: flex; flex-wrap: wrap; gap: 6px; }
+.cookie-sites { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.cookie-sites:empty { display: none; }
 .tag { font-style: normal; font-size: 11px; line-height: 20px; height: 20px; padding: 0 8px; border-radius: 6px; background: var(--fill); color: var(--label-2); white-space: nowrap; }
 .desc > summary { list-style: none; cursor: pointer; width: fit-content; font-size: 12px; color: var(--label-2); }
 .desc > summary::-webkit-details-marker { display: none; }
@@ -307,6 +309,14 @@ select { height: 28px; padding: 0 8px; border-radius: 7px; background: var(--fil
 /* Supported sites */
 .sites { margin: auto; width: min(520px, calc(100vw - 32px)); height: min(560px, calc(100vh - 48px)); padding: 16px; border: none; color: inherit; flex-direction: column; gap: 12px; }
 .sites[open] { display: flex; }
+.ask { margin: auto; width: min(440px, calc(100vw - 32px)); padding: 20px; border: none; color: inherit; flex-direction: column; gap: 10px; }
+.ask[open] { display: flex; }
+.ask::backdrop { background: rgb(0 0 0 / 0.3); backdrop-filter: blur(2px); }
+.ask h2 { font-size: 15px; font-weight: 600; }
+.ask-note, .ask small { color: var(--label-2); font-size: 12px; }
+.ask small:empty { display: none; }
+.ask-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.ask-row .grow { flex: 1; }
 .sites::backdrop { background: rgb(0 0 0 / 0.3); backdrop-filter: blur(2px); }
 .sites .section { margin: 0; }
 .sites-list { list-style: none; overflow-y: auto; columns: 2 160px; column-gap: 16px; user-select: text; }

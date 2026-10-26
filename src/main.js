@@ -299,6 +299,7 @@ form.addEventListener("submit", async (e) => {
     if (n !== probing) return;
     errorEl.innerHTML = errHtml(err);
     errorEl.hidden = false;
+    if (needsCookies(err)) askCookies(err, () => form.requestSubmit());
   } finally {
     if (n === probing) {
       logEl.hidden = true;
@@ -341,6 +342,12 @@ const errHtml = (e) => String(e).split("\n").map((l, i) => i ? `<small>${esc(l)}
 function fail(it, error) {
   Object.assign(it, { status: "failed", error });
   finished++;
+  // retry every download that failed for want of a sign-in
+  if (needsCookies(error)) askCookies(error, () => {
+    for (const i of items) if (i.status === "failed" && needsCookies(i.error)) { Object.assign(i, { status: "queued", error: null }); finished--; }
+    pump();
+    renderQueue();
+  });
   notify("Download failed", it.title);
 }
 
@@ -516,17 +523,51 @@ const cookieStatus = $("#cookie-status");
 const cookieBrowser = $("#cookie-browser");
 cookieBrowser.value = store("cookieBrowser") ?? "chrome";
 cookieBrowser.addEventListener("change", () => store("cookieBrowser", cookieBrowser.value));
-const showCookies = (on, note) => {
+const showCookies = async (on, note) => {
   $("#cookie-remove").hidden = !on;
   cookieStatus.textContent = note ?? (on ? "Imported; re-import when sign-in expires" : "Sign-in for YouTube, Instagram, X and other sites");
+  $("#cookie-sites").replaceChildren();
+  if (!on) return;
+  // the signed-in sites yt-dlp can download from
+  const sites = await invoke("cookie_sites").catch(() => []);
+  $("#cookie-sites").replaceChildren(...sites.map((s) => Object.assign(document.createElement("i"), { className: "tag", textContent: s })));
 };
-$("#cookie-import").addEventListener("click", () => busy($("#cookie-import"), "Importing…", async () => {
-  cookieStatus.textContent = "Reading cookies; allow access if your system asks…";
+// true when it worked; the outcome lands in the Settings row and in `out`
+async function importCookies(browser, out) {
+  out.textContent = cookieStatus.textContent = "Reading cookies; allow access if your system asks…";
   try {
-    showCookies(true, `Imported ${await invoke("import_cookies", { browser: cookieBrowser.value })}`);
+    const note = `Imported ${await invoke("import_cookies", { browser })}`;
+    out.textContent = note;
+    showCookies(true, note);
+    return true;
   } catch (e) {
-    cookieStatus.innerHTML = errHtml(e);
+    out.innerHTML = cookieStatus.innerHTML = errHtml(e);
+    return false;
   }
+}
+$("#cookie-import").addEventListener("click", () => busy($("#cookie-import"), "Importing…", () => importCookies(cookieBrowser.value, cookieStatus)));
+
+// A fetch or download failed in a way signing in fixes: offer to import cookies, then retry
+const ask = $("#cookie-ask");
+let askRetry;
+// shortcut: spotted by the backend's explanation pointing at Settings → Browser cookies; tag errors with a kind if that wording changes
+const needsCookies = (e) => String(e).includes("Browser cookies");
+function askCookies(error, retry) {
+  if (ask.open) return;
+  askRetry = retry;
+  $("#ask-why").textContent = String(error).split("\n")[0];
+  $("#ask-status").textContent = "";
+  $("#ask-browser").replaceChildren(...[...cookieBrowser.options].map((o) => o.cloneNode(true)));
+  $("#ask-browser").value = cookieBrowser.value;
+  ask.showModal();
+}
+$("#ask-cancel").addEventListener("click", () => ask.close());
+$("#ask-import").addEventListener("click", () => busy($("#ask-import"), "Importing…", async () => {
+  cookieBrowser.value = $("#ask-browser").value;
+  store("cookieBrowser", cookieBrowser.value);
+  if (!(await importCookies(cookieBrowser.value, $("#ask-status")))) return;
+  ask.close();
+  askRetry?.();
 }));
 $("#cookie-remove").addEventListener("click", () => invoke("remove_cookies").then(() => showCookies(false), (e) => (cookieStatus.textContent = String(e))));
 
