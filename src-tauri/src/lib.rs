@@ -7,7 +7,7 @@ use std::{
     sync::Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
-use velopack::{UpdateCheck, UpdateInfo, UpdateManager, sources::GithubSource};
+use velopack::{HttpOptions, UpdateCheck, UpdateInfo, UpdateManager, sources::HttpSource};
 
 const REPO: &str = "https://github.com/LordVersA/personal-downloader";
 
@@ -583,7 +583,13 @@ async fn install_ytdlp(app: AppHandle) -> Result<String, String> {
 
 fn updater() -> Result<UpdateManager, String> {
     // fails when the app wasn't installed by Velopack, e.g. `tauri dev`
-    UpdateManager::new(GithubSource::new(REPO, None, false), None, None).map_err(|_| "Updates work in installed builds".to_string())
+    // the latest release's files straight from github.com: no API rate limit, and a timeout (GithubSource has none, so a
+    // stalled connection left "Checking…" up forever)
+    let feed = HttpSource::new_with_options(
+        format!("{REPO}/releases/latest/download"),
+        HttpOptions { TimeoutMilliseconds: 120_000, ..Default::default() },
+    );
+    UpdateManager::new(feed, None, None).map_err(|_| "Updates work in installed builds".to_string())
 }
 
 // Checks GitHub Releases and downloads the update (a delta when possible); returns the new version, if any
