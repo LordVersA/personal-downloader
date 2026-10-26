@@ -297,7 +297,7 @@ pick.addEventListener("submit", (e) => {
     const width = String(pl.entries.length).length;
     enqueue(...info.entries.map((e) => ({
       ...it, url: e.webpage_url ?? e.url, title: e.title ?? e.url, thumb: thumbOf(e), dir: folder,
-      opts: { ...it.opts, prefix: has("number") ? `${String(e.playlist_index ?? pl.entries.indexOf(e) + 1).padStart(width, "0")} - ` : "" },
+      opts: { ...it.opts, prefix: has("number") ? `${String(Number.isInteger(e.playlist_index) ? e.playlist_index : pl.entries.indexOf(e) + 1).padStart(width, "0")} - ` : "" },
     })));
   }
   form.link.value = "";

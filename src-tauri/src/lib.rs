@@ -430,7 +430,11 @@ fn download(app: AppHandle, jobs: State<Jobs>, id: u32, url: String, dir: String
     let mut cmd = ytdlp(&app);
     // an empty --proxy means a direct connection
     cmd.args(["--proxy", &proxy]);
-    // playlist downloads number files by playlist order: "003 - Title.mp4"
+    // playlist downloads number files by playlist order: "003 - Title.mp4"; the number comes from site data, so only digits pass
+    let n = opts.prefix.strip_suffix(" - ").unwrap_or("x");
+    if !opts.prefix.is_empty() && (n.is_empty() || n.len() > 6 || !n.bytes().all(|b| b.is_ascii_digit())) {
+        return Err("Invalid file number".into());
+    }
     cmd.arg("-o").arg(format!("{}%(title)s.%(ext)s", opts.prefix));
     cmd.args(DOWNLOAD_ARGS).arg(&dir).arg("--merge-output-format").arg(&opts.container).arg("-f").arg(&opts.format);
     // video lands in the chosen container even when the site serves a single file in another one
