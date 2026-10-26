@@ -23,6 +23,7 @@
         <input id="link" name="link" dir="auto" placeholder="Paste a link" autofocus spellcheck="false" />
         <button class="key" type="submit" id="fetch">Fetch</button>
       </form>
+      <p class="probe-log nums" id="probe-log" aria-live="polite" hidden></p>
       <p class="error" id="error" dir="auto" role="alert" hidden></p>
 
       <button class="strip card" type="button" id="strip" hidden></button>
@@ -58,6 +59,24 @@
           <b class="folder-path" id="dir" dir="auto"></b>
           <button class="btn" type="button" id="dir-btn">Change</button>
         </div>
+        <div class="setting"><span>Proxy<small id="proxy-status"></small></span>
+          <button class="btn" type="button" id="proxy-test" hidden>Test</button>
+          <select id="proxy-type" aria-label="Proxy type"><option value="">None</option><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select>
+        </div>
+        <div class="setting proxy-fields" id="proxy-fields" hidden>
+          <input class="search" id="proxy-host" type="text" placeholder="Address" aria-label="Proxy address" spellcheck="false" autocomplete="off" />
+          <input class="search port nums" id="proxy-port" type="text" inputmode="numeric" maxlength="5" placeholder="Port" aria-label="Proxy port" />
+          <input class="search" id="proxy-user" type="text" placeholder="Username (optional)" aria-label="Proxy username" spellcheck="false" autocomplete="off" />
+          <input class="search" id="proxy-pass" type="password" placeholder="Password (optional)" aria-label="Proxy password" autocomplete="off" />
+        </div>
+        <div class="setting"><span>Browser cookies<small id="cookie-status">Sign-in for YouTube, Instagram, X and other sites</small></span>
+          <button class="btn" type="button" id="cookie-remove" hidden>Remove</button>
+          <select id="cookie-browser" aria-label="Browser to import cookies from">
+            <option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option><option value="edge">Edge</option>
+            <option value="brave">Brave</option><option value="opera">Opera</option><option value="vivaldi">Vivaldi</option><option value="chromium">Chromium</option><option value="whale">Whale</option>
+          </select>
+          <button class="btn" type="button" id="cookie-import">Import</button>
+        </div>
       </div>
       <h2 class="section">yt-dlp</h2>
       <div class="group card">
@@ -66,9 +85,10 @@
           <button class="btn" type="button" id="check" hidden>Check now</button>
           <button class="btn primary" type="button" id="use-builtin" hidden>Use built-in yt-dlp</button>
         </div>
-        <label class="setting"><span>Update channel<small>Nightly fixes site breakages sooner</small></span>
-          <select id="channel"><option value="stable">Stable</option><option value="nightly">Nightly</option></select>
-        </label>
+        <div class="setting">
+          <span>Supported sites<small>Everything this yt-dlp can download from</small></span>
+          <button class="btn" type="button" id="sites-btn">Show</button>
+        </div>
       </div>
       <h2 class="section">About</h2>
       <div class="group card">
@@ -79,5 +99,13 @@
         </div>
       </div>
     </main>
+
+    <dialog class="card sites" id="sites">
+      <h2 class="section">Supported sites <span class="nums" id="sites-count"></span>
+        <input class="search" id="sites-search" type="search" placeholder="Search" aria-label="Search sites" spellcheck="false" />
+        <button class="link-btn" type="button" id="sites-close">Done</button>
+      </h2>
+      <ul class="sites-list" id="sites-list"></ul>
+    </dialog>
   </body>
 </html>

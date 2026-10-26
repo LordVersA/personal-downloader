@@ -23,9 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 
-# Bundled binaries (yt-dlp, ffmpeg, deno) are downloaded by CI, not committed
-src-tauri/resources/bin/*
-!src-tauri/resources/bin/.gitkeep
 
 # Velopack output
 Releases/

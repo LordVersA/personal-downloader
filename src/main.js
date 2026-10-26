@@ -6,6 +6,8 @@ const finder = isMac ? "Show in Finder" : "Show in folder";
 
 const ICON = {
   stop: '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="M7 4.5v15L19 12z"/></svg>',
   retry: '<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5"/></svg>',
   check: '<svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>',
   down: '<svg viewBox="0 0 24 24"><path d="M12 4v12m-5-5 5 5 5-5M5 20h14"/></svg>',
@@ -28,6 +30,15 @@ const items = []; // this session's queue: queued, active or failed; done ones m
 let batch = 0, finished = 0; // "n of m" since the queue last emptied
 let saved = null; // last finished download, shown in the strip for a few seconds
 let dir = store("dir");
+// "" = direct connection; credentials are URL-encoded so @ and : in a password survive
+const PROXY_KEYS = ["type", "host", "port", "user", "pass"];
+const pf = (k) => $(`#proxy-${k}`);
+function proxy() {
+  const [type, host, port, user, pass] = PROXY_KEYS.map((k) => pf(k).value.trim());
+  if (!type || !host) return "";
+  const auth = user ? `${encodeURIComponent(user)}${pass ? `:${encodeURIComponent(pass)}` : ""}@` : "";
+  return `${type}://${auth}${host}${port ? `:${port}` : ""}`;
+}
 let history = load("history") ?? [];
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -85,7 +96,9 @@ document.addEventListener("keydown", (e) => {
 /* Quality picker */
 
 let info, infoUrl, choices = [];
-let opts = load("opts") ?? { metadata: true, embed: true, thumbnail: false, sponsors: false, subs: [], auto: "" };
+let opts = { container: "mp4", afmt: "mp3", ...(load("opts") ?? { metadata: true, embed: true, thumbnail: false, sponsors: false, subs: [], auto: "" }) };
+const compact = (n) => new Intl.NumberFormat(undefined, { notation: "compact" }).format(n);
+const plural = (n, w) => `${compact(n)} ${w}${n === 1 ? "" : "s"}`; // chapters, subtitles
 
 function buildChoices() {
   const d = info.duration;
@@ -103,23 +116,27 @@ function buildChoices() {
   const vid = (f, group, q) => ({
     group,
     q,
-    d: [codec(f.vcodec), fps(f) && `${fps(f)} fps`, f.dynamic_range && f.dynamic_range !== "SDR" && f.dynamic_range, f.acodec !== "none" && "with audio"].filter(Boolean).join(" · "),
+    d: [codec(f.vcodec), f.width && f.height && `${f.width}×${f.height}`, fps(f) && `${fps(f)} fps`, f.dynamic_range && f.dynamic_range !== "SDR" && f.dynamic_range,
+      f.vbr || f.tbr ? `${Math.round(f.vbr || f.tbr)} kbps` : "", f.acodec !== "none" && "+ audio"],
     format: f.acodec === "none" ? `${f.format_id}+ba[ext=m4a]/${f.format_id}+ba/${f.format_id}` : f.format_id,
     size: withAudio(f),
   });
-  const aud = (f, group, q) => ({ group, q, d: [f.ext, codec(f.acodec), f.abr && `${Math.round(f.abr)}k`, f.language].filter(Boolean).join(" · "), format: f.format_id, audio: true, size: size(f) });
+  const aud = (f, group, q) => ({ group, q, d: [codec(f.acodec), f.abr && `${Math.round(f.abr)} kbps`, f.asr && `${f.asr / 1000} kHz`, f.audio_channels > 2 && `${f.audio_channels} ch`, f.language], format: f.format_id, audio: true, ext: f.ext, size: size(f) });
   // video is sorted best-first, so the first format of each height is that height's best
   const heights = new Set();
   const perHeight = video.filter((f) => f.height && !heights.has(f.height) && heights.add(f.height));
   const top = video[0];
+  // audio-only sources (SoundCloud, podcasts…) get no Video section; no formats at all keeps yt-dlp's own "best"
+  const audioOnly = !video.length && audio.length;
   choices = [
-    top ? { ...vid(top, "Video", "Best"), d: `${top.height ? `${top.height}p${fps(top)} · ` : ""}${codec(top.vcodec)}` } : { group: "Video", q: "Best", d: "Highest available", format: "bv*+ba/b", size: 0 },
+    audioOnly ? null : top ? { ...vid(top, "Video", "Best"), d: [codec(top.vcodec), top.height && `${top.height}p`, fps(top) && `${fps(top)} fps`] } : { group: "Video", q: "Best", d: ["", "Highest available"], format: "bv*+ba/b", size: 0 },
     ...perHeight.map((f) => vid(f, "Video", `${f.height}p`)),
-    { group: "Audio", q: "MP3", d: "Best audio, converted", format: "ba/b", mp3: true, audio: true, size: ba },
+    { group: "Audio", q: "Convert", d: ["", "Best audio, re-encoded"], format: "ba/b", convert: true, audio: true, size: ba },
     ...(audio[0] ? [aud(audio[0], "Audio", "Original")] : []),
     ...video.map((f) => vid(f, "All", f.height ? `${f.height}p${fps(f)}` : (f.format_note ?? f.format_id))),
     ...audio.map((f) => aud(f, "All", f.abr ? `${Math.round(f.abr)} kbps` : (f.format_note ?? f.format_id))),
-  ];
+
+  ].filter(Boolean);
 }
 
 function renderPick() {
@@ -128,15 +145,16 @@ function renderPick() {
   const auto = Object.entries(info.automatic_captions ?? {});
   const opt = (c, i) => `
     <label class="opt"><input type="radio" name="q" value="${i}" ${i ? "" : "checked"} />
-      <span class="q">${esc(c.q)}</span><span class="d">${esc(c.d)}</span><span class="s nums">${c.size ? mb(c.size) : ""}</span></label>`;
+      <span class="q">${esc(c.q)}</span><span class="d">${c.d[0] ? `<i class="tag">${esc(c.d[0])}</i>` : ""}${c.d.slice(1).filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("")}</span><span class="s nums">${c.size ? mb(c.size) : ""}</span></label>`;
   const group = (g) => choices.map((c, i) => (c.group === g ? opt(c, i) : "")).join("");
   const toggle = (name, label) => `<label class="toggle"><input type="checkbox" name="${name}" ${opts[name] ? "checked" : ""} /><span>${label}</span></label>`;
+  const select = (name, vals) => `<select name="${name}">${vals.map((v) => `<option value="${v}" ${opts[name] === v ? "selected" : ""}>${v.toUpperCase()}</option>`).join("")}</select>`;
   const all = choices.filter((c) => c.group === "All").length;
   const count = info._type === "playlist" && `${info.entries?.length ?? "?"} items`;
   pick.innerHTML = `
     <header class="pick-head">${btn("close", "Close", ICON.stop)}</header>
     <div class="choices">
-      <fieldset><legend>Video</legend>${group("Video")}</fieldset>
+      ${group("Video") ? `<fieldset><legend>Video</legend>${group("Video")}</fieldset>` : ""}
       <fieldset><legend>Audio</legend>${group("Audio")}</fieldset>
       ${all ? `<details class="all"><summary>All formats (${all})</summary><fieldset>${group("All")}</fieldset></details>` : ""}
     </div>
@@ -154,15 +172,43 @@ function renderPick() {
             ${toggle("thumbnail", "Embed thumbnail")}
             ${info.extractor_key === "Youtube" ? toggle("sponsors", "Cut sponsor segments") : ""}
           </fieldset>
+          <fieldset class="formats"><legend>File format</legend>
+            <label>Video ${select("container", ["mp4", "mkv", "webm", "mov"])}</label>
+            <label>Audio ${select("afmt", ["mp3", "m4a", "opus", "flac", "wav"])}</label>
+          </fieldset>
         </div>
       </details>
       <button class="key" type="submit" id="go"></button>
     </footer>`;
   pick.firstElementChild.prepend(row("div", "item", info.thumbnail ?? info.thumbnails?.at(-1)?.url, info.title ?? infoUrl,
     [esc(info.uploader ?? info.channel ?? info.extractor_key ?? ""), info.duration && dur(info.duration), count]));
+  pick.firstElementChild.after(about());
   pick.hidden = false;
   updatePick();
   renderHistory();
+}
+
+// Facts yt-dlp found about the video; each shows only when the site reports it
+function about() {
+  const i = info;
+  const day = i.upload_date && new Date(`${i.upload_date.slice(0, 4)}-${i.upload_date.slice(4, 6)}-${i.upload_date.slice(6)}`);
+  const live = { is_live: "Live now", was_live: "Live recording", is_upcoming: "Upcoming", post_live: "Live recording (processing)" }[i.live_status];
+  const stats = [[i.view_count, "views"], [i.like_count, "likes"], [i.comment_count, "comments"], [i.channel_follower_count, "followers"]].filter(([n]) => n != null);
+  const facts = [
+    day && day.toLocaleDateString(undefined, { dateStyle: "medium" }),
+    live,
+    i.age_limit >= 18 && "18+",
+    i.availability && i.availability !== "public" && i.availability.replace(/_/g, " "),
+    i.chapters?.length && plural(i.chapters.length, "chapter"),
+    Object.keys(i.subtitles ?? {}).filter((l) => l !== "live_chat").length && plural(Object.keys(i.subtitles).filter((l) => l !== "live_chat").length, "subtitle"),
+    i.categories?.[0],
+  ].filter(Boolean);
+  const el = document.createElement("div");
+  el.className = "about";
+  el.innerHTML = (stats.length ? `<p class="stats nums">${stats.map(([n, w]) => `<span><b>${compact(n)}</b> ${w}</span>`).join("")}</p>` : "") +
+    `<p class="facts">${facts.map((f) => `<i class="tag">${esc(f)}</i>`).join("")}</p>` +
+    (i.description ? `<details class="desc"><summary>Description</summary><p dir="auto">${esc(i.description)}</p></details>` : "");
+  return el;
 }
 
 // Reads the current choices; the Download label, options summary and remembered options follow them
@@ -175,7 +221,7 @@ function readPick() {
 
 function updatePick() {
   const { c, subs, autoLang, has } = readPick();
-  $("#go").textContent = `Download${c?.size ? ` · ${mb(c.size)}` : ""}`;
+  $("#go").textContent = `Download ${c?.audio ? (c.convert ? pick.afmt.value : c.ext ?? "") .toUpperCase() : pick.container.value.toUpperCase()}${c?.size ? ` · ${mb(c.size)}` : ""}`.replace("  ", " ");
   const langs = [...subs, autoLang].filter(Boolean);
   $("#opts-sum").textContent = [langs.length && `Subtitles (${langs.join(", ")})`, has("metadata") && "Metadata", has("thumbnail") && "Thumbnail", has("sponsors") && "Sponsors cut"]
     .filter(Boolean).join(" · ") || "None";
@@ -195,23 +241,26 @@ pick.addEventListener("submit", (e) => {
   const { c, subs, autoLang, has } = readPick();
   // remember the toggles that exist for this video; keep the others as they were
   for (const n of ["metadata", "embed", "thumbnail", "sponsors"]) if (pick[n]) opts[n] = has(n);
+  Object.assign(opts, { container: pick.container.value, afmt: pick.afmt.value });
   if (pick.querySelector("[name=sub], [name=auto]")) Object.assign(opts, { subs, auto: autoLang });
   store("opts", JSON.stringify(opts));
   enqueue({
     url: infoUrl,
     title: info.title ?? infoUrl,
     thumb: info.thumbnail ?? info.thumbnails?.at(-1)?.url,
-    label: c.group !== "Audio" ? c.q : c.mp3 ? "MP3" : "Audio",
+    label: c.audio ? (c.convert ? opts.afmt.toUpperCase() : "Audio") : `${c.q} · ${opts.container.toUpperCase()}`,
     size: c.size,
     opts: {
       format: c.format,
-      mp3: !!c.mp3,
+      container: opts.container,
+      convert: c.convert ? opts.afmt : "",
       audio: !!c.audio,
       subs: autoLang ? [...subs, autoLang] : subs,
       auto_subs: !!autoLang,
       embed_subs: !c.audio && has("embed"),
-      thumbnail: has("thumbnail"),
-      metadata: has("metadata"),
+      // music always gets full tags and cover art; WAV and WebM audio can't hold a cover
+      thumbnail: has("thumbnail") || (c.audio && !["wav", "webm"].includes(c.convert ? opts.afmt : c.ext)),
+      metadata: has("metadata") || !!c.audio,
       sponsors: has("sponsors"),
     },
   });
@@ -220,6 +269,9 @@ pick.addEventListener("submit", (e) => {
 });
 
 const errorEl = $("#error");
+const logEl = $("#probe-log");
+// yt-dlp's current step while fetching, e.g. "[youtube] abc: Downloading webpage"
+listen("probe-log", (e) => (logEl.textContent = e.payload));
 const fetchBtn = $("#fetch");
 let probing = 0; // a newer fetch makes older results stale
 form.addEventListener("submit", async (e) => {
@@ -235,18 +287,21 @@ form.addEventListener("submit", async (e) => {
   const n = ++probing;
   fetchBtn.classList.add("busy");
   fetchBtn.textContent = "Fetching…";
+  logEl.textContent = "";
+  logEl.hidden = false;
   try {
-    const res = await invoke("probe", { url });
+    const res = await invoke("probe", { url, proxy: proxy() });
     if (n !== probing) return;
     info = res;
     infoUrl = url;
     renderPick();
   } catch (err) {
     if (n !== probing) return;
-    errorEl.textContent = err;
+    errorEl.innerHTML = errHtml(err);
     errorEl.hidden = false;
   } finally {
     if (n === probing) {
+      logEl.hidden = true;
       fetchBtn.classList.remove("busy");
       fetchBtn.textContent = "Fetch";
     }
@@ -270,15 +325,18 @@ async function pump() {
   if (items.some((i) => i.status === "active")) return;
   const it = items.find((i) => i.status === "queued");
   if (!it) return;
-  Object.assign(it, { status: "active", progress: 0, p: null });
+  Object.assign(it, { status: "active", p: null });
   try {
-    await invoke("download", { id: it.id, url: it.url, dir, opts: it.opts });
+    await invoke("download", { id: it.id, url: it.url, dir, proxy: proxy(), opts: it.opts });
   } catch (e) {
     fail(it, e);
     pump();
     renderQueue();
   }
 }
+
+// the backend sends "explanation\nyt-dlp's own message"; show the explanation and keep the detail one glance away
+const errHtml = (e) => String(e).split("\n").map((l, i) => i ? `<small>${esc(l)}</small>` : esc(l)).join("");
 
 function fail(it, error) {
   Object.assign(it, { status: "failed", error });
@@ -295,8 +353,9 @@ async function notify(title, body) {
 }
 
 function metaOf(it) {
-  if (it.status === "failed") return [esc(it.error)];
-  if (it.status === "queued") return [esc(it.label), "Queued"];
+  if (it.status === "failed") return [esc(String(it.error).split("\n")[0])];
+  if (it.status === "queued") return [esc(it.label), it.progress ? `${Math.floor(it.progress)}% · Queued` : "Queued"];
+  if (it.status === "paused") return [esc(it.label), `${Math.floor(it.progress)}% · Paused`];
   const p = it.p;
   if (!p) return [esc(it.label), "Starting…"];
   const total = p.total_bytes ?? p.total_bytes_estimate;
@@ -307,9 +366,11 @@ function rowEl(it) {
   const active = it.status === "active";
   const right = `<span class="percent nums">${active ? `${Math.floor(it.progress)}%` : ""}</span><span class="actions">` +
     (it.status === "failed" ? btn("retry", "Try again", ICON.retry) + btn("dismiss", "Dismiss", ICON.stop)
-      : btn("stop", active ? "Stop download" : "Remove from queue", ICON.stop)) + "</span>";
+      : (active ? btn("pause", "Pause", ICON.pause) : it.status === "paused" ? btn("resume", "Resume", ICON.play) : "") +
+        btn("stop", active ? "Stop download" : "Remove from queue", ICON.stop)) + "</span>";
   const li = row("li", `item ${it.status}`, it.thumb, it.title, metaOf(it), right, active ? '<span class="tube"></span>' : "");
   li.dataset.id = it.id;
+  if (it.status === "failed") li.querySelector(".meta").title = it.error;
   li.style.setProperty("--p", `${it.progress}%`);
   return li;
 }
@@ -360,6 +421,8 @@ listen("dl", ({ payload: ev }) => {
     return renderStatus();
   }
   if (ev.kind === "failed") fail(it, ev.error);
+  // pause = stop the process but keep the item; yt-dlp picks up the .part file on resume
+  else if (ev.kind === "cancelled" && it.pausing) Object.assign(it, { status: "paused", pausing: false });
   else {
     items.splice(items.indexOf(it), 1);
     if (ev.kind === "cancelled") batch--;
@@ -368,7 +431,7 @@ listen("dl", ({ payload: ev }) => {
       saved = { title: it.title, path: ev.path };
       clearTimeout(savedTimer);
       savedTimer = setTimeout(() => { saved = null; renderStatus(); }, 6000);
-      history.unshift({ title: it.title, thumb: it.thumb, path: ev.path, label: it.label, size: it.size, at: Date.now() });
+      history.unshift({ title: it.title, thumb: it.thumb, path: ev.path, label: it.label, size: it.size, at: Date.now(), warnings: ev.warnings });
       saveHistory();
       notify("Download finished", it.title);
     }
@@ -383,7 +446,12 @@ queue.addEventListener("click", (e) => {
   const it = items.find((i) => i.id === Number(b.closest(".item").dataset.id));
   const act = b.dataset.act;
   if (act === "stop" && it.status === "active") return invoke("cancel", { id: it.id });
-  if (act === "retry") {
+  if (act === "pause") {
+    it.pausing = true;
+    return invoke("cancel", { id: it.id });
+  }
+  if (act === "resume") it.status = "queued";
+  else if (act === "retry") {
     Object.assign(it, { status: "queued", error: null });
     finished--;
   } else {
@@ -405,7 +473,7 @@ function saveHistory() {
 }
 
 const histEl = (h, i) => {
-  const li = row("li", "item done", h.thumb, h.title, [`${ICON.check} ${esc(h.label ?? "")}`, h.size && mb(h.size), when(h.at)],
+  const li = row("li", "item done", h.thumb, h.title, [`${ICON.check} ${esc(h.label ?? "")}`, h.size && mb(h.size), when(h.at), h.warnings?.length && `<span class="warn" title="${esc(h.warnings.join("\n"))}">${h.warnings.length} warning${h.warnings.length > 1 ? "s" : ""}</span>`],
     `<span class="actions">${btn("open", "Open", ICON.play)}${btn("reveal", finder, ICON.folder)}${btn("remove", "Remove from history", ICON.stop)}</span>`);
   li.dataset.i = i;
   li.tabIndex = 0;
@@ -443,6 +511,25 @@ $("#clear").addEventListener("click", () => { history = []; saveHistory(); });
 
 /* Settings */
 
+// Browser cookies: one snapshot of the signed-in browser, used for every fetch and download
+const cookieStatus = $("#cookie-status");
+const cookieBrowser = $("#cookie-browser");
+cookieBrowser.value = store("cookieBrowser") ?? "chrome";
+cookieBrowser.addEventListener("change", () => store("cookieBrowser", cookieBrowser.value));
+const showCookies = (on, note) => {
+  $("#cookie-remove").hidden = !on;
+  cookieStatus.textContent = note ?? (on ? "Imported; re-import when sign-in expires" : "Sign-in for YouTube, Instagram, X and other sites");
+};
+$("#cookie-import").addEventListener("click", () => busy($("#cookie-import"), "Importing…", async () => {
+  cookieStatus.textContent = "Reading cookies; allow access if your system asks…";
+  try {
+    showCookies(true, `Imported ${await invoke("import_cookies", { browser: cookieBrowser.value })}`);
+  } catch (e) {
+    cookieStatus.innerHTML = errHtml(e);
+  }
+}));
+$("#cookie-remove").addEventListener("click", () => invoke("remove_cookies").then(() => showCookies(false), (e) => (cookieStatus.textContent = String(e))));
+
 const home = await window.__TAURI__.path.homeDir().catch(() => "");
 const showDir = () => {
   $("#dir").textContent = home && dir.startsWith(home) ? `~${dir.slice(home.replace(/[\\/]$/, "").length)}` : dir;
@@ -455,14 +542,11 @@ $("#dir-btn").addEventListener("click", async () => {
 
 // yt-dlp: the app's own standalone copy updates itself; a system one (pip, Homebrew…) can be swapped for it
 const status = $("#status");
-const channel = $("#channel");
 const useBuiltin = $("#use-builtin");
-channel.value = store("channel") ?? "stable";
-channel.addEventListener("change", () => store("channel", channel.value));
-const nightly = () => channel.value === "nightly";
 let ytdlp = {};
 async function refreshYtdlp(note) {
   ytdlp = await invoke("ytdlp_info").catch(() => ({}));
+  showCookies(ytdlp.cookies);
   $("#ytdlp-ver").textContent = ytdlp.version ? `yt-dlp ${ytdlp.version}` : "yt-dlp not found";
   status.textContent = note ?? (ytdlp.managed ? "Built-in, updates itself" : ytdlp.version ? "System install (pip, Homebrew…); the app can't update it" : "Install it to start downloading");
   $("#check").hidden = !ytdlp.managed;
@@ -477,15 +561,63 @@ async function busy(b, label, work) {
 }
 async function checkUpdates() {
   status.textContent = "Checking for updates…";
-  const note = await invoke("update_ytdlp", { nightly: nightly() }).catch(String);
+  const note = await invoke("update_ytdlp").catch(String);
   await refreshYtdlp(note);
 }
 $("#check").addEventListener("click", () => busy($("#check"), "Checking…", checkUpdates));
 useBuiltin.addEventListener("click", () => busy(useBuiltin, "Downloading…", async () => {
   status.textContent = "Downloading the standalone yt-dlp…";
-  const note = await invoke("install_ytdlp", { nightly: nightly() }).catch(String);
+  const note = await invoke("install_ytdlp").catch(String);
   await refreshYtdlp(note);
 }));
+
+function showProxy() {
+  $("#proxy-fields").hidden = $("#proxy-test").hidden = !pf("type").value;
+  $("#proxy-status").textContent = "";
+}
+$("#proxy-test").addEventListener("click", () => busy($("#proxy-test"), "Testing…", async () => {
+  const st = $("#proxy-status");
+  st.className = "";
+  st.textContent = "Reaching YouTube through the proxy…";
+  try {
+    st.textContent = await invoke("test_proxy", { proxy: proxy() });
+    st.className = "ok";
+  } catch (e) {
+    st.textContent = String(e);
+    st.className = "bad";
+  }
+}));
+// shortcut: the proxy password sits in localStorage in plain text; move it to the OS keychain if that matters
+const savedProxy = load("proxy") ?? {};
+for (const k of PROXY_KEYS) {
+  pf(k).value = savedProxy[k] ?? "";
+  pf(k).addEventListener("change", () => {
+    store("proxy", JSON.stringify(Object.fromEntries(PROXY_KEYS.map((k) => [k, pf(k).value.trim()]))));
+    showProxy();
+  });
+}
+showProxy();
+
+// Supported sites: yt-dlp's extractor list, one row per site (youtube:tab etc. fold into youtube)
+const sites = $("#sites");
+let siteNames = [];
+function renderSites() {
+  const q = $("#sites-search").value.trim().toLowerCase();
+  const shown = siteNames.filter((n) => n.toLowerCase().includes(q));
+  $("#sites-count").textContent = shown.length;
+  $("#sites-list").replaceChildren(...shown.map((n) => Object.assign(document.createElement("li"), { textContent: n })));
+}
+$("#sites-btn").addEventListener("click", () => busy($("#sites-btn"), "Loading…", async () => {
+  if (!siteNames.length) {
+    const list = await invoke("list_sites").catch((e) => { status.textContent = String(e); });
+    if (!list) return;
+    siteNames = [...new Set(list.map((n) => n.split(":")[0]).filter((n) => n && n !== "generic" && !n.includes("BROKEN")))].sort((a, b) => a.localeCompare(b));
+  }
+  renderSites();
+  sites.showModal();
+}));
+$("#sites-search").addEventListener("input", renderSites);
+$("#sites-close").addEventListener("click", () => sites.close());
 
 // App updates: Velopack downloads a delta in the background, then a restart applies it
 const appStatus = $("#app-status");
@@ -508,5 +640,7 @@ dir ??= await window.__TAURI__.path.downloadDir();
 showDir();
 renderHistory();
 renderQueue();
-refreshYtdlp().then(() => ytdlp.managed && checkUpdates());
+// first launch downloads yt-dlp, ffmpeg and deno; later launches return at once
+status.textContent = "Getting yt-dlp, ffmpeg and deno…";
+invoke("install_tools").then(() => refreshYtdlp().then(() => ytdlp.managed && checkUpdates()), (e) => refreshYtdlp(`Couldn't download tools: ${e}`));
 checkApp(true);

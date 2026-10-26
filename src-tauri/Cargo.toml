@@ -27,7 +27,10 @@ serde_json = "1"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 velopack = "1.2.161"
-ureq = "3.4" # already pulled in by velopack; used to fetch the standalone yt-dlp
+ureq = { version = "3.4", features = ["socks-proxy"] } # already pulled in by velopack; fetches yt-dlp, ffmpeg and deno, and tests the proxy
+# also already pulled in by velopack: checksum and unpack the tools fetched on first launch
+sha2 = "0.10"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

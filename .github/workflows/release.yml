@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+# one release at a time: each build needs the previous release published to make its delta
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   VPK_VERSION: 1.2.161 # keep in step with the velopack crate in src-tauri/Cargo.toml
   PACK_ID: PersonalDownloader
@@ -48,8 +53,6 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Bundled tools (yt-dlp, ffmpeg, deno)
-        run: scripts/fetch-bins.sh ${{ matrix.target }}
       - name: Build
         run: npx tauri build --target ${{ matrix.target }} ${{ runner.os == 'macOS' && '--bundles app' || '--no-bundle' }} --config "{\"version\":\"$VERSION\"}"
       - name: Stage pack dir
@@ -61,8 +64,7 @@ jobs:
             Linux) exe=personal-downloader; icon=src-tauri/icons/icon.png ;;
           esac
           if [ "$RUNNER_OS" != macOS ]; then
-            # no Tauri bundle here, so put the resources next to the exe, where the app also looks for them
-            pack=pack; mkdir -p pack; cp "$out/$exe" pack/; cp -R src-tauri/resources pack/
+            pack=pack; mkdir -p pack; cp "$out/$exe" pack/
           fi
           { echo "PACK=$pack"; echo "EXE=$exe"; echo "ICON=$icon"; } >> "$GITHUB_ENV"
       - uses: actions/setup-dotnet@v4 # vpk runs on .NET 10
