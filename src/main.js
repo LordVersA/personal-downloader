@@ -662,6 +662,7 @@ function renderHistory() {
 // file may have been moved or deleted since; nothing useful to do then
 const reveal = (path) => opener.revealItemInDir(path).catch(() => {});
 const openFile = (path) => opener.openPath(path).catch(() => {});
+$("#repo").addEventListener("click", () => opener.openUrl("https://github.com/LordVersA/personal-downloader").catch(() => {}));
 function onHistory(e) {
   const li = e.target.closest("[data-i]");
   if (!li) return;
@@ -845,3 +846,8 @@ renderQueue();
 status.textContent = "Getting yt-dlp, ffmpeg and deno…";
 invoke("install_tools").then(() => refreshYtdlp().then(() => ytdlp.managed && checkUpdates()), (e) => refreshYtdlp(`Couldn't download tools: ${e}`));
 checkApp(true);
+// a window left open for days still picks up updates; yt-dlp can't replace itself while a download runs it
+setInterval(() => {
+  checkApp(true);
+  if (ytdlp.managed && !items.some((i) => i.status === "active")) checkUpdates();
+}, 864e5);
