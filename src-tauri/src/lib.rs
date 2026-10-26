@@ -373,14 +373,18 @@ struct Opts {
     thumbnail: bool,
     metadata: bool,
     sponsors: bool,
+    #[serde(default)]
+    prefix: String,
 }
 
+// One JSON line per item: a single video comes back whole (with formats), a playlist or channel as flat entries streamed
+// as each page loads ("probe-entry"); cancel(id) stops a long listing
 #[tauri::command]
-async fn probe(app: AppHandle, url: String, proxy: String) -> Result<Value, String> {
-    // --no-quiet: -J hides yt-dlp's step lines; they come on stdout before the JSON and go to the UI as "probe-log"
+async fn probe(app: AppHandle, id: u32, url: String, proxy: String) -> Result<(), String> {
+    // --no-quiet: -j hides yt-dlp's step lines; they come on stdout between the JSON lines and go to the UI as "probe-log"
     let mut child = ytdlp(&app)
         .args(["--proxy", &proxy])
-        .args(["-J", "--no-quiet", "--flat-playlist", "--no-playlist", "--"])
+        .args(["-j", "--no-quiet", "--flat-playlist", "--no-playlist", "--"])
         .arg(&url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -388,24 +392,26 @@ async fn probe(app: AppHandle, url: String, proxy: String) -> Result<Value, Stri
         .map_err(start_err)?;
     let out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
+    app.state::<Jobs>().0.lock().unwrap().insert(id, child);
     let errs = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = err.read_to_string(&mut s);
         s
     });
-    let mut json = String::new();
     for line in BufReader::new(out).lines().map_while(Result::ok) {
-        if line.starts_with('{') {
-            json = line;
-        } else if !line.trim().is_empty() {
-            let _ = app.emit("probe-log", &line);
+        match serde_json::from_str::<Value>(&line) {
+            Ok(entry) => drop(app.emit("probe-entry", json!({"id": id, "entry": entry}))),
+            Err(_) if !line.trim().is_empty() => drop(app.emit("probe-log", &line)),
+            Err(_) => {}
         }
     }
     let stderr = errs.join().unwrap_or_default();
-    if !child.wait().is_ok_and(|s| s.success()) {
-        return Err(last_error(&stderr));
+    // cancel() removes the child, so a missing entry means the user stopped it
+    let child = app.state::<Jobs>().0.lock().unwrap().remove(&id);
+    match child.map(|mut c| c.wait()) {
+        Some(Ok(s)) if !s.success() => Err(last_error(&stderr)),
+        _ => Ok(()),
     }
-    serde_json::from_str(&json).map_err(|e| e.to_string())
 }
 
 #[rustfmt::skip]
@@ -416,7 +422,7 @@ const DOWNLOAD_ARGS: &[&str] = &[
     "--progress-template", "download:%(progress)j",
     "--print", "video:%(.{title,thumbnail})j",
     "--print", "after_move:filepath",
-    "-o", "%(title)s.%(ext)s", "-P",
+    "-P",
 ];
 
 #[tauri::command]
@@ -424,6 +430,8 @@ fn download(app: AppHandle, jobs: State<Jobs>, id: u32, url: String, dir: String
     let mut cmd = ytdlp(&app);
     // an empty --proxy means a direct connection
     cmd.args(["--proxy", &proxy]);
+    // playlist downloads number files by playlist order: "003 - Title.mp4"
+    cmd.arg("-o").arg(format!("{}%(title)s.%(ext)s", opts.prefix));
     cmd.args(DOWNLOAD_ARGS).arg(&dir).arg("--merge-output-format").arg(&opts.container).arg("-f").arg(&opts.format);
     // video lands in the chosen container even when the site serves a single file in another one
     if !opts.audio {

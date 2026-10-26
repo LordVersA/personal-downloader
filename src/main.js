@@ -100,7 +100,21 @@ let opts = { container: "mp4", afmt: "mp3", ...(load("opts") ?? { metadata: true
 const compact = (n) => new Intl.NumberFormat(undefined, { notation: "compact" }).format(n);
 const plural = (n, w) => `${compact(n)} ${w}${n === 1 ? "" : "s"}`; // chapters, subtitles
 
+// A playlist's videos each have their own formats, so it gets height caps that fit any video
+const HEIGHTS = [2160, 1440, 1080, 720, 480];
+const LANGS = { en: "English", fa: "Farsi", ar: "Arabic", es: "Spanish", fr: "French", de: "German", ru: "Russian", tr: "Turkish", pt: "Portuguese", it: "Italian", hi: "Hindi", ja: "Japanese", ko: "Korean", zh: "Chinese" };
+
 function buildChoices() {
+  if (info._type === "playlist") {
+    choices = [
+      { group: "Video", q: "Best", d: ["", "Highest available"], format: "bv*+ba/b", size: 0 },
+      ...HEIGHTS.map((h) => ({ group: "Video", q: `${h}p`, d: ["", "or the best below"], format: `bv*[height<=${h}]+ba/b[height<=${h}]`, size: 0 })),
+      { group: "Audio", q: "Convert", d: ["", "Best audio, re-encoded"], format: "ba/b", convert: true, audio: true, size: 0 },
+      // m4a first: it takes a cover; webm audio can't
+      { group: "Audio", q: "Original", d: ["", "Best audio as served"], format: "ba[ext=m4a]/ba/b", audio: true, ext: "m4a", size: 0 },
+    ];
+    return;
+  }
   const d = info.duration;
   const size = (f) => f.filesize ?? f.filesize_approx ?? (f.tbr && d ? f.tbr * d * 125 : 0);
   const hls = (f) => (f.protocol?.startsWith("m3u8") ? 1 : 0); // prefer direct downloads over HLS duplicates
@@ -140,9 +154,11 @@ function buildChoices() {
 }
 
 function renderPick() {
+  pick.dataset.step = "pick";
   buildChoices();
   const subs = Object.keys(info.subtitles ?? {}).filter((l) => l !== "live_chat");
   const auto = Object.entries(info.automatic_captions ?? {});
+  const list = info._type === "playlist";
   const opt = (c, i) => `
     <label class="opt"><input type="radio" name="q" value="${i}" ${i ? "" : "checked"} />
       <span class="q">${esc(c.q)}</span><span class="d">${c.d[0] ? `<i class="tag">${esc(c.d[0])}</i>` : ""}${c.d.slice(1).filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("")}</span><span class="s nums">${c.size ? mb(c.size) : ""}</span></label>`;
@@ -150,7 +166,7 @@ function renderPick() {
   const toggle = (name, label) => `<label class="toggle"><input type="checkbox" name="${name}" ${opts[name] ? "checked" : ""} /><span>${label}</span></label>`;
   const select = (name, vals) => `<select name="${name}">${vals.map((v) => `<option value="${v}" ${opts[name] === v ? "selected" : ""}>${v.toUpperCase()}</option>`).join("")}</select>`;
   const all = choices.filter((c) => c.group === "All").length;
-  const count = info._type === "playlist" && `${info.entries?.length ?? "?"} items`;
+  const count = info._type === "playlist" && plural(info.entries.length, "video");
   pick.innerHTML = `
     <header class="pick-head">${btn("close", "Close", ICON.stop)}</header>
     <div class="choices">
@@ -161,13 +177,19 @@ function renderPick() {
     <footer class="pick-foot">
       <details class="opts"><summary><b>Options</b><svg viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></svg><span id="opts-sum"></span></summary>
         <div class="panel card">
+          ${list ? `<fieldset class="subs"><legend>Subtitles</legend>
+            <select name="sublang" aria-label="Subtitle language"><option value="">None</option>
+              ${Object.entries(LANGS).map(([l, n]) => `<option value="${l}" ${l === opts.lang ? "selected" : ""}>${n}</option>`).join("")}</select>
+            ${toggle("autosubs", "Auto-generated if none")}
+          </fieldset>` : ""}
           ${subs.length || auto.length ? `<fieldset class="subs"><legend>Subtitles</legend>
             ${subs.map((l) => `<label class="chip"><input type="checkbox" name="sub" value="${esc(l)}" ${opts.subs.includes(l) ? "checked" : ""} /><span>${esc(info.subtitles[l][0]?.name ?? l)}</span></label>`).join("")}
             ${auto.length ? `<select name="auto" aria-label="Auto-generated subtitles"><option value="">Auto-generated: none</option>
               ${auto.map(([l, f]) => `<option value="${esc(l)}" ${l === opts.auto ? "selected" : ""}>${esc(f[0]?.name ?? l)}</option>`).join("")}</select>` : ""}
           </fieldset>` : ""}
           <fieldset><legend>Options</legend>
-            ${subs.length || auto.length ? toggle("embed", "Embed subtitles in video") : ""}
+            ${subs.length || auto.length || list ? toggle("embed", "Embed subtitles in video") : ""}
+            ${list ? toggle("number", "Number files by playlist order") : ""}
             ${toggle("metadata", "Add metadata and chapters")}
             ${toggle("thumbnail", "Embed thumbnail")}
             ${info.extractor_key === "Youtube" ? toggle("sponsors", "Cut sponsor segments") : ""}
@@ -182,7 +204,7 @@ function renderPick() {
     </footer>`;
   pick.firstElementChild.prepend(row("div", "item", info.thumbnail ?? info.thumbnails?.at(-1)?.url, info.title ?? infoUrl,
     [esc(info.uploader ?? info.channel ?? info.extractor_key ?? ""), info.duration && dur(info.duration), count]));
-  pick.firstElementChild.after(about());
+  if (!list) pick.firstElementChild.after(about());
   pick.hidden = false;
   updatePick();
   renderHistory();
@@ -216,38 +238,42 @@ function readPick() {
   const c = choices[pick.q.value];
   const subs = [...pick.querySelectorAll("[name=sub]:checked")].map((x) => x.value);
   const autoLang = pick.auto?.value ?? "";
+  // a playlist's language matches every regional variant (en-US, en-GB…); yt-dlp skips videos without it
+  if (pick.sublang?.value) subs.push(`${pick.sublang.value}.*`);
   return { c, subs, autoLang, has: (n) => !!pick[n]?.checked };
 }
 
 function updatePick() {
   const { c, subs, autoLang, has } = readPick();
-  $("#go").textContent = `Download ${c?.audio ? (c.convert ? pick.afmt.value : c.ext ?? "") .toUpperCase() : pick.container.value.toUpperCase()}${c?.size ? ` · ${mb(c.size)}` : ""}`.replace("  ", " ");
+  $("#go").textContent = `Download ${info._type === "playlist" ? `${plural(info.entries.length, "video")} · ` : ""}${c?.audio ? (c.convert ? pick.afmt.value : c.ext ?? "") .toUpperCase() : pick.container.value.toUpperCase()}${c?.size ? ` · ${mb(c.size)}` : ""}`.replace("  ", " ");
   const langs = [...subs, autoLang].filter(Boolean);
   $("#opts-sum").textContent = [langs.length && `Subtitles (${langs.join(", ")})`, has("metadata") && "Metadata", has("thumbnail") && "Thumbnail", has("sponsors") && "Sponsors cut"]
     .filter(Boolean).join(" · ") || "None";
 }
 
 function closePick() {
+  if (pl?.loading) invoke("cancel", { id: probeId });
+  pl = null;
+  delete pick.dataset.step;
   pick.hidden = true;
   pick.replaceChildren();
   renderHistory();
 }
 
-pick.addEventListener("change", updatePick);
+pick.addEventListener("change", () => (pick.dataset.step === "list" ? listCount() : updatePick()));
 pick.addEventListener("click", (e) => e.target.closest("[data-act=close]") && closePick());
 document.addEventListener("pointerdown", (e) => { const d = pick.querySelector(".opts[open]"); if (d && !d.contains(e.target)) d.open = false; });
 pick.addEventListener("submit", (e) => {
   e.preventDefault();
+  if (pick.dataset.step === "list") return; // Enter in the list's search field
   const { c, subs, autoLang, has } = readPick();
   // remember the toggles that exist for this video; keep the others as they were
-  for (const n of ["metadata", "embed", "thumbnail", "sponsors"]) if (pick[n]) opts[n] = has(n);
+  for (const n of ["metadata", "embed", "thumbnail", "sponsors", "autosubs", "number"]) if (pick[n]) opts[n] = has(n);
   Object.assign(opts, { container: pick.container.value, afmt: pick.afmt.value });
   if (pick.querySelector("[name=sub], [name=auto]")) Object.assign(opts, { subs, auto: autoLang });
+  if (pick.sublang) opts.lang = pick.sublang.value;
   store("opts", JSON.stringify(opts));
-  enqueue({
-    url: infoUrl,
-    title: info.title ?? infoUrl,
-    thumb: info.thumbnail ?? info.thumbnails?.at(-1)?.url,
+  const it = {
     label: c.audio ? (c.convert ? opts.afmt.toUpperCase() : "Audio") : `${c.q} · ${opts.container.toUpperCase()}`,
     size: c.size,
     opts: {
@@ -256,14 +282,24 @@ pick.addEventListener("submit", (e) => {
       convert: c.convert ? opts.afmt : "",
       audio: !!c.audio,
       subs: autoLang ? [...subs, autoLang] : subs,
-      auto_subs: !!autoLang,
+      auto_subs: !!autoLang || (!!pick.sublang?.value && has("autosubs")),
       embed_subs: !c.audio && has("embed"),
       // music always gets full tags and cover art; WAV and WebM audio can't hold a cover
       thumbnail: has("thumbnail") || (c.audio && !["wav", "webm"].includes(c.convert ? opts.afmt : c.ext)),
       metadata: has("metadata") || !!c.audio,
       sponsors: has("sponsors"),
     },
-  });
+  };
+  if (info._type !== "playlist") enqueue({ ...it, url: infoUrl, title: info.title ?? infoUrl, thumb: info.thumbnail ?? info.thumbnails?.at(-1)?.url });
+  else {
+    // each video is its own queue item, saved in a folder named after the playlist
+    const folder = `${dir}${dir.endsWith(SEP) ? "" : SEP}${safeName(info.title)}`;
+    const width = String(pl.entries.length).length;
+    enqueue(...info.entries.map((e) => ({
+      ...it, url: e.webpage_url ?? e.url, title: e.title ?? e.url, thumb: thumbOf(e), dir: folder,
+      opts: { ...it.opts, prefix: has("number") ? `${String(e.playlist_index ?? pl.entries.indexOf(e) + 1).padStart(width, "0")} - ` : "" },
+    })));
+  }
   form.link.value = "";
   closePick();
 });
@@ -273,8 +309,9 @@ const logEl = $("#probe-log");
 // yt-dlp's current step while fetching, e.g. "[youtube] abc: Downloading webpage"
 listen("probe-log", (e) => (logEl.textContent = e.payload));
 const fetchBtn = $("#fetch");
-let probing = 0; // a newer fetch makes older results stale
-form.addEventListener("submit", async (e) => {
+let probeId = 0; // the running fetch; a newer one makes older results stale
+let got = 0; // lines the running fetch has sent
+form.addEventListener("submit", (e) => {
   e.preventDefault();
   const url = form.link.value.trim();
   errorEl.hidden = true;
@@ -284,39 +321,146 @@ form.addEventListener("submit", async (e) => {
     form.classList.add("shake");
     return;
   }
-  const n = ++probing;
+  infoUrl = url;
+  // a YouTube channel lists one tab at a time
+  const base = url.match(CHANNEL)?.[1];
+  fetchLink(base ? `${base}/videos` : url, base && { base, tab: "videos" });
+});
+
+// tab: open the list right away for that channel tab; otherwise the first line says whether it's a video or a list
+async function fetchLink(url, tab) {
+  if (probeId) invoke("cancel", { id: probeId });
+  const id = (probeId = nextId++);
+  got = 0;
+  pl = null;
+  if (tab) openList(tab);
   fetchBtn.classList.add("busy");
   fetchBtn.textContent = "Fetching…";
   logEl.textContent = "";
   logEl.hidden = false;
   try {
-    const res = await invoke("probe", { url, proxy: proxy() });
-    if (n !== probing) return;
-    info = res;
-    infoUrl = url;
-    renderPick();
+    await invoke("probe", { id, url, proxy: proxy() });
+    if (id === probeId && !got) throw "There's nothing to download at this link.";
   } catch (err) {
-    if (n !== probing) return;
+    if (id !== probeId) return;
     errorEl.innerHTML = errHtml(err);
     errorEl.hidden = false;
-    if (needsCookies(err)) askCookies(err, () => form.requestSubmit());
+    if (needsCookies(err)) askCookies(err, () => fetchLink(url, tab));
   } finally {
-    if (n === probing) {
+    if (id === probeId) {
       logEl.hidden = true;
       fetchBtn.classList.remove("busy");
       fetchBtn.textContent = "Fetch";
+      if (pl) pl.loading = false;
+      if (pick.dataset.step === "list") listCount();
     }
   }
+}
+
+listen("probe-entry", ({ payload: { id, entry } }) => {
+  // past the list step the selection is fixed
+  if (id !== probeId || (pl && pick.dataset.step !== "list")) return;
+  got++;
+  // a single video comes back whole; list entries carry their place in the playlist
+  if (!pl && entry.playlist_index == null && entry._type !== "url") {
+    info = entry;
+    return renderPick();
+  }
+  if (!pl) openList({});
+  addEntry(entry);
 });
+
+/* Playlist and channel list: search, select, then pick one quality for all */
+
+const CHANNEL = /^(https?:\/\/(?:www\.|m\.)?youtube\.com\/(?:@|channel\/|c\/|user\/)[^/?#]+)\/?(?:[?#]|$)/;
+const TABS = { videos: "Videos", shorts: "Shorts", streams: "Live" };
+const SEP = navigator.userAgent.includes("Windows") ? "\\" : "/";
+// a playlist title as a folder name every OS accepts
+const safeName = (t) => String(t ?? "").replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").replace(/[. ]+$/, "").trim().slice(0, 120) || "Playlist";
+const thumbOf = (e) => e.thumbnail ?? e.thumbnails?.at(-1)?.url;
+const dead = (e) => /^\[(private|deleted)/i.test(e.title ?? "") || e.availability === "private";
+const locked = (e) => ["subscriber_only", "premium_only", "needs_auth"].includes(e.availability);
+let pl = null; // the list on screen: { base, tab, title, entries, loading }
+
+function openList(tab) {
+  pl = { ...tab, title: "", entries: [], loading: true };
+  info = null;
+  pick.dataset.step = "list";
+  pick.innerHTML = `
+    <header class="pick-head"><b class="list-title" dir="auto"></b>${btn("close", "Close", ICON.stop)}</header>
+    ${pl.tab ? `<nav class="seg">${Object.entries(TABS).map(([t, l]) => `<button type="button" data-tab="${t}" aria-pressed="${t === pl.tab}">${l}</button>`).join("")}</nav>` : ""}
+    <div class="list-bar">
+      <input class="search" type="search" name="find" dir="auto" placeholder="Search" aria-label="Search videos" spellcheck="false" />
+      <span class="list-status nums"></span>
+      <button class="link-btn" type="button" data-act="stop-list">Stop</button>
+      <span class="grow"></span>
+      <button class="link-btn" type="button" data-act="all">Select all</button>
+      <button class="link-btn" type="button" data-act="none">None</button>
+    </div>
+    <div class="list entries"></div>
+    <footer class="pick-foot"><span class="grow"></span><button class="key" type="button" data-act="next"></button></footer>`;
+  pick.hidden = false;
+  listCount();
+  renderHistory();
+}
+
+function addEntry(e) {
+  const i = pl.entries.push(e) - 1;
+  if (!pl.title) pick.querySelector(".list-title").textContent = pl.title = e.playlist_title ?? e.playlist ?? "";
+  const off = dead(e);
+  const el = row("label", `item entry${off ? " dead" : ""}`, off ? null : thumbOf(e), e.title ?? e.url,
+    [e.duration && dur(e.duration), locked(e) && "🔒 Members", off && "Unavailable"], `<input type="checkbox" value="${i}" ${off ? "disabled" : ""} />`);
+  el.hidden = !matches(e);
+  pick.querySelector(".entries").append(el);
+  // shortcut: recounts per entry; batch with requestAnimationFrame if huge channels feel slow
+  listCount();
+}
+
+const matches = (e) => (e.title ?? "").toLowerCase().includes(pick.find?.value.trim().toLowerCase() ?? "");
+const checked = () => [...pick.querySelectorAll(".entries input:checked")].map((c) => pl.entries[c.value]);
+
+function listCount() {
+  const n = pick.querySelectorAll(".entries input:checked").length, all = pl.entries.length;
+  pick.querySelector(".list-status").textContent = pl.loading ? `Loading… ${plural(all, "video")}` : plural(all, "video");
+  pick.querySelector("[data-act=stop-list]").hidden = !pl.loading;
+  const next = pick.querySelector("[data-act=next]");
+  next.textContent = n ? `Choose quality · ${plural(n, "video")}` : "Select videos";
+  next.disabled = !n;
+}
+
+pick.addEventListener("input", (e) => {
+  if (e.target.name !== "find") return;
+  for (const el of pick.querySelectorAll(".entry")) el.hidden = !matches(pl.entries[el.querySelector("input").value]);
+});
+pick.addEventListener("click", (e) => {
+  const t = e.target.closest("[data-tab], [data-act]");
+  if (!t || !pl) return;
+  if (t.dataset.tab) return t.dataset.tab !== pl.tab && fetchLink(`${pl.base}/${t.dataset.tab}`, { base: pl.base, tab: t.dataset.tab });
+  const act = t.dataset.act;
+  if (act === "stop-list") invoke("cancel", { id: probeId });
+  if (act === "all" || act === "none") {
+    for (const c of pick.querySelectorAll(".entry:not([hidden]) input:not(:disabled)")) c.checked = act === "all";
+    listCount();
+  }
+  if (act === "next") {
+    const sel = checked();
+    if (pl.loading) invoke("cancel", { id: probeId });
+    info = { _type: "playlist", title: pl.title || infoUrl, entries: sel, thumbnail: thumbOf(sel[0]), uploader: sel[0].playlist_uploader ?? sel[0].channel, extractor_key: sel[0].ie_key ?? sel[0].extractor_key };
+    renderPick();
+  }
+});
+
 // pasting a URL fetches right away
 form.link.addEventListener("paste", () => setTimeout(() => /^https?:\/\/\S+$/.test(form.link.value.trim()) && form.requestSubmit()));
 
 /* Queue: one download at a time */
 
-function enqueue(it) {
-  Object.assign(it, { id: nextId++, status: "queued", progress: 0, p: null });
-  items.push(it);
-  batch++;
+function enqueue(...its) {
+  for (const it of its) {
+    Object.assign(it, { id: nextId++, status: "queued", progress: 0, p: null });
+    items.push(it);
+    batch++;
+  }
   saved = null;
   pump();
   renderQueue();
@@ -328,7 +472,7 @@ async function pump() {
   if (!it) return;
   Object.assign(it, { status: "active", p: null });
   try {
-    await invoke("download", { id: it.id, url: it.url, dir, proxy: proxy(), opts: it.opts });
+    await invoke("download", { id: it.id, url: it.url, dir: it.dir ?? dir, proxy: proxy(), opts: it.opts });
   } catch (e) {
     fail(it, e);
     pump();
@@ -343,11 +487,7 @@ function fail(it, error) {
   Object.assign(it, { status: "failed", error });
   finished++;
   // retry every download that failed for want of a sign-in
-  if (needsCookies(error)) askCookies(error, () => {
-    for (const i of items) if (i.status === "failed" && needsCookies(i.error)) { Object.assign(i, { status: "queued", error: null }); finished--; }
-    pump();
-    renderQueue();
-  });
+  if (needsCookies(error)) askCookies(error, () => retryFailed((i) => needsCookies(i.error)));
   notify("Download failed", it.title);
 }
 
@@ -399,8 +539,28 @@ function renderStatus() {
 }
 strip.addEventListener("click", () => (strip.classList.contains("done") ? reveal(saved.path) : show("library")));
 
+function retryFailed(which = () => true) {
+  for (const i of items) if (i.status === "failed" && which(i)) { Object.assign(i, { status: "queued", error: null }); finished--; }
+  pump();
+  renderQueue();
+}
+$("#retry-all").addEventListener("click", () => retryFailed());
+// drop everything waiting, then stop the active one; its "cancelled" event removes it
+$("#cancel-all").addEventListener("click", () => {
+  for (const i of items.filter((i) => i.status !== "active")) {
+    items.splice(items.indexOf(i), 1);
+    batch--;
+    if (i.status === "failed") finished--;
+  }
+  const act = items.find((i) => i.status === "active");
+  if (act) invoke("cancel", { id: act.id });
+  renderQueue();
+});
+
 function renderQueue() {
   if (!items.length) batch = finished = 0;
+  $("#q-count").textContent = batch > 1 ? `${finished} / ${batch}` : "";
+  $("#retry-all").hidden = !items.some((i) => i.status === "failed");
   queue.replaceChildren(...items.map(rowEl));
   $("#downloads").hidden = !items.length;
   renderStatus();

@@ -82,4 +82,5 @@ Not in v1: playlist UI, subtitles, cookies/login, scheduling, i18n (all just yt-
 - [x] Redesign: native look, Download / Library / Settings tabs, curated qualities, auto-RTL Farsi content (Vazirmatn), OS notifications
 - [x] Phase 4b Velopack app updater: check on startup + Settings, "Restart to update"
 - [x] Phase 5 CI + release: `ci.yml` (fmt, clippy), `release.yml` on `v*` tags (4 platforms, delta packages, notes from commits)
+- [x] Playlists & channels: streamed flat listing (`-j --flat-playlist`), search + select, YouTube channel tabs, one quality for all (height caps), one queue item per video in a playlist folder, Cancel all / Retry failed
 - [ ] macOS signing + notarization (needs an Apple Developer ID)

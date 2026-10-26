@@ -39,7 +39,10 @@
 
     <main class="page" id="library" role="tabpanel" hidden>
       <section id="downloads" hidden>
-        <h2 class="section">In progress</h2>
+        <h2 class="section">In progress <span class="nums q-count" id="q-count"></span>
+          <button class="link-btn" type="button" id="retry-all" hidden>Retry failed</button>
+          <button class="link-btn" type="button" id="cancel-all">Cancel all</button>
+        </h2>
         <ul class="list card" id="queue"></ul>
       </section>
       <section>
