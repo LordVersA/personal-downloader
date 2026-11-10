@@ -2,8 +2,8 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read},
-    path::PathBuf,
-    process::{Child, Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, ChildStderr, ChildStdout, Command, Stdio},
     sync::Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -127,7 +127,22 @@ fn fetch_deno(dir: &std::path::Path) -> Result<(), String> {
     unzip(dir, fetch(&url, |_| format!("{url}.sha256sum"), "")?, &[exe("deno")])
 }
 
-// The app ships without yt-dlp, ffmpeg and deno; fetch whichever are missing on first launch
+// aria2 publishes no macOS build and no checksums, so .github/workflows/aria2.yml builds and mirrors 1.37.0 into this repo
+fn fetch_aria2(dir: &std::path::Path) -> Result<(), String> {
+    let file = if cfg!(windows) {
+        "aria2c-windows-x86_64.zip"
+    } else if cfg!(target_os = "macos") {
+        "aria2c-macos.zip"
+    } else if cfg!(target_arch = "aarch64") {
+        "aria2c-linux-aarch64.zip"
+    } else {
+        "aria2c-linux-x86_64.zip"
+    };
+    let base = format!("{REPO}/releases/download/aria2-1.37.0");
+    unzip(dir, fetch(&format!("{base}/{file}"), |_| format!("{base}/SHA2-256SUMS"), file)?, &[exe("aria2c")])
+}
+
+// The app ships without yt-dlp, ffmpeg, deno and aria2c; fetch whichever are missing on first launch
 #[tauri::command]
 async fn install_tools(app: AppHandle) -> Result<(), String> {
     let dir = bin_dir(&app);
@@ -144,7 +159,34 @@ async fn install_tools(app: AppHandle) -> Result<(), String> {
     if !has("deno") {
         fetch_deno(&dir)?;
     }
+    if !has("aria2c") {
+        fetch_aria2(&dir)?;
+    }
     Ok(())
+}
+
+// First version-looking word of each tool's version line ("ffmpeg version N-1234-g…" → "N-1234-g…"); null when missing
+#[tauri::command]
+async fn tool_versions(app: AppHandle) -> Value {
+    let v = |name: &str, flag: &str| {
+        let o = tool(&app, bin_dir(&app).join(exe(name))).arg(flag).output().ok()?;
+        let out = String::from_utf8_lossy(&o.stdout);
+        out.lines()
+            .next()?
+            .split_whitespace()
+            .find(|w| w.starts_with(|c: char| c.is_ascii_digit()) || w.starts_with("N-"))
+            .map(str::to_string)
+    };
+    json!({"ffmpeg": v("ffmpeg", "-version"), "deno": v("deno", "--version"), "aria2c": v("aria2c", "--version")})
+}
+
+// "Update all": yt-dlp only when a new release is out; ffmpeg and deno track "latest", so re-fetch them. aria2c is pinned
+#[tauri::command]
+async fn update_tools(app: AppHandle) -> Result<String, String> {
+    let dir = bin_dir(&app);
+    fetch_ffmpeg(&dir)?;
+    fetch_deno(&dir)?;
+    update_ytdlp(app).await.map(|y| format!("{y}; ffmpeg and deno refreshed"))
 }
 
 // (release zip, executable inside it); the unpacked build starts in ~0.2 s, the single-file one unpacks itself on every run (~14 s on macOS)
@@ -322,14 +364,11 @@ fn remove_cookies(app: AppHandle) -> Result<(), String> {
     std::fs::remove_file(cookies_file(&app)).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e.to_string()) })
 }
 
-fn ytdlp(app: &AppHandle) -> Command {
-    let dir = bin_dir(app);
-    let exe = ytdlp_exe(app);
-    // until install_tools has run (or if it failed), fall back to yt-dlp on PATH
-    let mut cmd = Command::new(if exe.exists() { exe.into_os_string() } else { "yt-dlp".into() });
-    // ffmpeg and deno are found through PATH
+fn tool(app: &AppHandle, exe: PathBuf) -> Command {
+    let mut cmd = Command::new(exe);
+    // ffmpeg, deno and aria2c are found through PATH
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let paths = std::iter::once(dir).chain(std::env::split_paths(&path));
+    let paths = std::iter::once(bin_dir(app)).chain(std::env::split_paths(&path));
     if let Ok(p) = std::env::join_paths(paths) {
         cmd.env("PATH", p);
     }
@@ -338,15 +377,221 @@ fn ytdlp(app: &AppHandle) -> Command {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    // own process group, so cancel() can stop the tool's child processes too
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd
+}
+
+fn ytdlp(app: &AppHandle) -> Command {
+    let exe = ytdlp_exe(app);
+    // until install_tools has run (or if it failed), fall back to yt-dlp on PATH
+    let mut cmd = tool(app, if exe.exists() { exe } else { "yt-dlp".into() });
     // signed-in sessions imported from a browser; yt-dlp also writes refreshed cookies back to this file
     let cookies = cookies_file(app);
     if cookies.exists() {
         cmd.arg("--cookies").arg(cookies);
     }
-    // own process group, so cancel() can stop yt-dlp's child processes too
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd
+}
+
+// Direct files and torrents. aria2c has no SOCKS support, and sending the download around the proxy would leak it
+// The caller adds its own options, then `--` and the link
+fn aria2(app: &AppHandle, dir: &Path, proxy: &str) -> Result<Command, String> {
+    if proxy.starts_with("socks") {
+        return Err("aria2c can't use a SOCKS proxy. Switch the proxy to HTTP in Settings, or turn it off for this download.".into());
+    }
+    let exe = bin_dir(app).join(exe("aria2c"));
+    if !exe.exists() {
+        return Err("aria2c isn't installed yet. Restart the app to fetch it.".into());
+    }
+    let mut cmd = tool(app, exe);
+    // -c resumes the .aria2 control file, so pause (a kill) and resume work; --seed-time=0: never upload after finishing.
+    // Into a pipe aria2c only flushes its progress line along with the summary, so print that every second
+    #[rustfmt::skip]
+    cmd.args([
+        "--no-conf", "-c", "--console-log-level=notice", "--summary-interval=1", "--download-result=hide",
+        "--file-allocation=none", "-x16", "-s16", "--min-split-size=1M", "--seed-time=0", "--auto-file-renaming=true",
+    ]);
+    cmd.arg("--dir").arg(dir);
+    if !proxy.is_empty() {
+        cmd.arg(format!("--all-proxy={proxy}"));
+    }
+    let cookies = cookies_file(app);
+    if cookies.exists() {
+        cmd.arg("--load-cookies").arg(cookies);
+    }
+    Ok(cmd)
+}
+
+// A magnet's metadata, or the .torrent file a link points to, saved into a folder of its own, then its file list.
+// download() gets the saved .torrent, so the metadata is fetched only once
+#[tauri::command]
+async fn torrent_files(app: AppHandle, id: u32, url: String, proxy: String) -> Result<Value, String> {
+    let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("torrents").join(id.to_string());
+    // ids restart each launch; the folder may hold an earlier session's torrent
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut cmd = aria2(&app, &dir, &proxy)?;
+    cmd.args(["--bt-metadata-only=true", "--bt-save-metadata=true", "--follow-torrent=false", "--"]).arg(&url);
+    // shortcut: a magnet nobody seeds waits until the user fetches something else; add a timeout if that confuses people
+    match watch(&app, id, start(&app, id, cmd)?) {
+        None => return Ok(Value::Null),
+        Some(Err(e)) => return Err(e),
+        Some(Ok(_)) => {}
+    }
+    let torrent = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| Some(e.ok()?.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "torrent"))
+        .ok_or("This link isn't a torrent.")?;
+    let out = tool(&app, bin_dir(&app).join(exe("aria2c"))).args(["--no-conf", "-S", "-T"]).arg(&torrent).output().map_err(start_err)?;
+    let (name, files) = torrent_list(&String::from_utf8_lossy(&out.stdout));
+    if files.is_empty() {
+        return Err(format!("Couldn't read this torrent.\n{}", String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or_default()));
+    }
+    Ok(json!({"torrent": torrent, "name": name, "files": files}))
+}
+
+// aria2c -S: "Name: X", then after the "idx|path/length" header "  1|./X/a.mkv" and "   |1.2GiB (1,234,567,890)"
+fn torrent_list(s: &str) -> (String, Vec<Value>) {
+    let mut name = String::new();
+    let mut lines = s.lines();
+    for l in lines.by_ref() {
+        if let Some(n) = l.strip_prefix("Name: ") {
+            name = n.to_string();
+        }
+        if l == "idx|path/length" {
+            break;
+        }
+    }
+    let mut files = vec![];
+    while let Some(l) = lines.next() {
+        let Some((i, path)) = l.split_once('|') else { continue };
+        let Ok(index) = i.trim().parse::<u32>() else { continue };
+        let size = lines.next().and_then(|n| n.rsplit_once('(')).map(|(_, n)| n.trim_end_matches(')').replace(',', ""));
+        let path = path.strip_prefix("./").unwrap_or(path);
+        files.push(json!({"index": index, "path": path, "length": size.and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)}));
+    }
+    (name, files)
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Tool {
+    YtDlp,
+    Aria2,
+    GalleryDl,
+    Streamlink,
+    SpotDl,
+    Nm3u8,
+}
+
+// File types that are never media pages; yt-dlp can't fetch these, aria2c can
+#[rustfmt::skip]
+const DIRECT: &[&str] = &[
+    "zip", "7z", "rar", "tar", "gz", "tgz", "xz", "bz2", "zst", "iso", "img", "dmg", "pkg", "exe", "msi",
+    "deb", "rpm", "apk", "appimage", "jar", "bin", "pdf", "epub",
+];
+
+// TOOLS-PLAN.md's routing table; no network, only the URL's shape
+fn pick_tool(url: &str) -> Tool {
+    let u = url.trim().to_ascii_lowercase();
+    if u.starts_with("magnet:") {
+        return Tool::Aria2;
+    }
+    let rest = u.split_once("://").map_or(u.as_str(), |(_, r)| r);
+    let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.rsplit('@').next().unwrap_or_default().split(':').next().unwrap_or_default();
+    let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).unwrap_or(host);
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let ext = segs.last().and_then(|s| s.rsplit_once('.')).map_or("", |(_, e)| e);
+    let site = |d: &str| host == d || host.ends_with(&format!(".{d}"));
+    if ext == "torrent" {
+        Tool::Aria2
+    } else if site("open.spotify.com") && segs.iter().any(|s| ["track", "album", "playlist", "artist"].contains(s)) {
+        Tool::SpotDl
+    } else if ext == "m3u8" || ext == "mpd" {
+        Tool::Nm3u8
+    } else if (site("twitch.tv") || site("kick.com")) && segs.len() == 1 || site("youtube.com") && segs.last() == Some(&"live") {
+        Tool::Streamlink
+    } else if ["instagram.com", "pixiv.net", "deviantart.com", "imgur.com", "tumblr.com"].iter().any(|d| site(d))
+        || site("reddit.com") && segs.first() == Some(&"gallery")
+        || (site("x.com") || site("twitter.com")) && segs.contains(&"photo")
+    {
+        Tool::GalleryDl
+    } else if DIRECT.contains(&ext) {
+        Tool::Aria2
+    } else {
+        Tool::YtDlp
+    }
+}
+
+// The tool the UI should use for this link.
+// shortcut: gallery-dl, streamlink, spotDL and N_m3u8DL-RE arrive in later phases; until then their links go to yt-dlp
+#[tauri::command]
+fn route(url: String) -> &'static str {
+    match pick_tool(&url) {
+        Tool::Aria2 => "aria2c",
+        _ => "yt-dlp",
+    }
+}
+
+// aria2c's once-a-second readout "[#2089b0 400.0KiB/33.2MiB(1%) CN:1 DL:115.7KiB ETA:4m51s]" in yt-dlp's progress shape;
+// torrents add "SD:3" and "UL:…"
+fn readout(line: &str) -> Option<Value> {
+    let body = line.trim().strip_prefix("[#")?.split(']').next()?;
+    let mut f = body.split_whitespace().skip(1);
+    let (done, total) = f.next()?.split('(').next()?.split_once('/')?;
+    let done = bytes(done)?;
+    let mut p = json!({"status": "downloading", "downloaded_bytes": done, "total_bytes": bytes(total)?});
+    for (k, v) in f.filter_map(|kv| kv.split_once(':')) {
+        match k {
+            "DL" => p["speed"] = json!(bytes(v)),
+            "ETA" => p["eta"] = json!(secs(v)),
+            // torrents only: connected peers, seeders among them, and "UL:50KiB(1.2MiB)" = upload speed (uploaded so far)
+            "CN" => p["peers"] = json!(v.parse::<u32>().ok()),
+            "SD" => p["seeds"] = json!(v.parse::<u32>().ok()),
+            "UL" => {
+                let (speed, sent) = v.split_once('(').unwrap_or((v, ""));
+                p["up"] = json!(bytes(speed));
+                if let Some(sent) = bytes(sent.trim_end_matches(')')).filter(|_| done > 0.0) {
+                    p["ratio"] = json!(sent / done);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(p)
+}
+
+// "33.2MiB" → bytes
+fn bytes(s: &str) -> Option<f64> {
+    let i = s.find(|c: char| c.is_ascii_alphabetic())?;
+    let unit = match &s[i..] {
+        "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    s[..i].parse::<f64>().ok().map(|n| n * unit)
+}
+
+// "1h4m51s" → seconds
+fn secs(s: &str) -> Option<u64> {
+    let (mut total, mut n) = (0, 0);
+    for c in s.chars() {
+        match c {
+            '0'..='9' => n = n * 10 + c.to_digit(10)? as u64,
+            'h' => (total, n) = (total + n * 3600, 0),
+            'm' => (total, n) = (total + n * 60, 0),
+            's' => (total, n) = (total + n, 0),
+            _ => return None,
+        }
+    }
+    Some(total)
 }
 
 fn start_err(e: std::io::Error) -> String {
@@ -379,7 +624,7 @@ const EXPLAIN: &[(&[&str], &str)] = &[
     (&["login required", "log in", "login to", "sign in", "--cookies", "requires authentication", "account is required", "rate-limit reached"], "This site wants you signed in. Sign in in your browser, then import its cookies in Settings → Browser cookies. If cookies are already imported, they may have expired; import again."),
     (&["http error 429", "too many requests"], "The site is rate-limiting you (too many requests). Wait a few minutes, or switch proxy."),
     (&["http error 401", "http error 403", "forbidden"], "The site refused the request (403). Update yt-dlp in Settings; if it keeps happening, try another proxy."),
-    (&["http error 404", "not found (404)"], "The site says this page doesn't exist (404). Check the link."),
+    (&["http error 404", "not found (404)", "resource not found"], "The site says this page doesn't exist (404). Check the link."),
     (&["http error 410"], "This content is gone from the site (410)."),
     (&["http error 5", "bad gateway", "service unavailable", "internal server error"], "The site's server is having trouble. Try again in a little while."),
     (&["unable to connect to proxy", "proxyerror", "proxy error", "socks", "tunnel connection failed"], "Couldn't connect through the proxy. Check the proxy in Settings (use Test), or turn it off."),
@@ -432,6 +677,7 @@ struct Opts {
     subs: Vec<String>,
     auto_subs: bool,
     embed_subs: bool,
+    #[serde(default)]
     thumbnail: bool,
     metadata: bool,
     sponsors: bool,
@@ -487,18 +733,66 @@ const DOWNLOAD_ARGS: &[&str] = &[
     "-P",
 ];
 
+// tool: "aria2c" for direct files and torrents (opts unused; files = "1,3", the torrent files to get), anything else is
+// yt-dlp; fast hands yt-dlp's plain HTTP downloads to aria2c, and a failure retries once with yt-dlp's own downloader
 #[tauri::command]
-fn download(app: AppHandle, jobs: State<Jobs>, id: u32, url: String, dir: String, proxy: String, opts: Opts) -> Result<(), String> {
-    let mut cmd = ytdlp(&app);
+#[allow(clippy::too_many_arguments)]
+fn download(
+    app: AppHandle,
+    id: u32,
+    url: String,
+    dir: String,
+    proxy: String,
+    opts: Option<Opts>,
+    tool: Option<String>,
+    fast: Option<bool>,
+    files: Option<String>,
+) -> Result<(), String> {
+    if tool.as_deref() == Some("aria2c") {
+        let mut cmd = aria2(&app, Path::new(&dir), &proxy)?;
+        if let Some(f) = files {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit() || b == b',') {
+                return Err("Invalid file selection".into());
+            }
+            cmd.arg(format!("--select-file={f}"));
+        }
+        cmd.arg("--").arg(&url);
+        let io = start(&app, id, cmd)?;
+        std::thread::spawn(move || finish(&app, id, watch(&app, id, io)));
+        return Ok(());
+    }
+    let opts = opts.ok_or("No download options")?;
+    // aria2c can't do SOCKS, and isn't there until install_tools has fetched it
+    let fast = fast.unwrap_or(true) && !proxy.starts_with("socks") && bin_dir(&app).join(exe("aria2c")).exists();
+    let io = start(&app, id, ytdlp_download(&app, &url, &dir, &proxy, &opts, fast)?)?;
+    std::thread::spawn(move || {
+        let mut r = watch(&app, id, io);
+        if fast && matches!(r, Some(Err(_))) {
+            r = match ytdlp_download(&app, &url, &dir, &proxy, &opts, false).and_then(|c| start(&app, id, c)) {
+                Ok(io) => watch(&app, id, io),
+                Err(e) => Some(Err(e)),
+            };
+        }
+        finish(&app, id, r);
+    });
+    Ok(())
+}
+
+fn ytdlp_download(app: &AppHandle, url: &str, dir: &str, proxy: &str, opts: &Opts, fast: bool) -> Result<Command, String> {
+    let mut cmd = ytdlp(app);
     // an empty --proxy means a direct connection
-    cmd.args(["--proxy", &proxy]);
+    cmd.args(["--proxy", proxy]);
+    if fast {
+        // yt-dlp sets --summary-interval=0, which leaves aria2c's progress stuck in its pipe buffer (see aria2())
+        cmd.args(["--downloader", "http:aria2c", "--downloader-args", "aria2c:--summary-interval=1"]);
+    }
     // playlist downloads number files by playlist order: "003 - Title.mp4"; the number comes from site data, so only digits pass
     let n = opts.prefix.strip_suffix(" - ").unwrap_or("x");
     if !opts.prefix.is_empty() && (n.is_empty() || n.len() > 6 || !n.bytes().all(|b| b.is_ascii_digit())) {
         return Err("Invalid file number".into());
     }
     cmd.arg("-o").arg(format!("{}%(title)s.%(ext)s", opts.prefix));
-    cmd.args(DOWNLOAD_ARGS).arg(&dir).arg("--merge-output-format").arg(&opts.container).arg("-f").arg(&opts.format);
+    cmd.args(DOWNLOAD_ARGS).arg(dir).arg("--merge-output-format").arg(&opts.container).arg("-f").arg(&opts.format);
     // video lands in the chosen container even when the site serves a single file in another one
     if !opts.audio {
         cmd.arg("--remux-video").arg(&opts.container);
@@ -537,36 +831,64 @@ fn download(app: AppHandle, jobs: State<Jobs>, id: u32, url: String, dir: String
     if opts.sponsors {
         cmd.args(["--sponsorblock-remove", "sponsor"]);
     }
-    let mut child = cmd.arg("--").arg(&url).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(start_err)?;
-    let out = child.stdout.take().unwrap();
-    let mut err = child.stderr.take().unwrap();
-    jobs.0.lock().unwrap().insert(id, child);
+    cmd.arg("--").arg(url);
+    Ok(cmd)
+}
 
-    std::thread::spawn(move || {
-        let errs = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = err.read_to_string(&mut s);
-            s
-        });
-        let mut path = String::new();
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            match serde_json::from_str::<Value>(&line) {
-                Ok(p) if p.get("status").is_some() => drop(app.emit("dl", json!({"id": id, "kind": "progress", "p": p}))),
-                Ok(info) => drop(app.emit("dl", json!({"id": id, "kind": "info", "info": info}))),
-                Err(_) => path = line,
-            }
-        }
-        let stderr = errs.join().unwrap_or_default();
-        // cancel() removes the child, so a missing entry means the user stopped it
-        let child = app.state::<Jobs>().0.lock().unwrap().remove(&id);
-        let ev = match child.map(|mut c| c.wait()) {
-            None => json!({"id": id, "kind": "cancelled"}),
-            Some(Ok(s)) if s.success() => json!({"id": id, "kind": "done", "path": path, "warnings": warnings(&stderr)}),
-            _ => json!({"id": id, "kind": "failed", "error": last_error(&stderr)}),
-        };
-        let _ = app.emit("dl", ev);
+// Runs `cmd` as job `id`, so cancel(id) can stop it
+fn start(app: &AppHandle, id: u32, mut cmd: Command) -> Result<(ChildStdout, ChildStderr), String> {
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(start_err)?;
+    let io = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    app.state::<Jobs>().0.lock().unwrap().insert(id, child);
+    Ok(io)
+}
+
+// Streams progress until the job exits: Ok((path, warnings)), Err(explained error), or None when the user stopped it
+type Outcome = Option<Result<(String, Vec<String>), String>>;
+fn watch(app: &AppHandle, id: u32, (out, mut err): (ChildStdout, ChildStderr)) -> Outcome {
+    let errs = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s);
+        s
     });
-    Ok(())
+    // yt-dlp prints the final path as its last plain line; aria2c logs "Download complete: <path>" before more output
+    let (mut last, mut done) = (String::new(), None);
+    for line in BufReader::new(out).lines().map_while(Result::ok) {
+        match serde_json::from_str::<Value>(&line) {
+            Ok(p) if p.get("status").is_some() => drop(app.emit("dl", json!({"id": id, "kind": "progress", "p": p}))),
+            Ok(info) => drop(app.emit("dl", json!({"id": id, "kind": "info", "info": info}))),
+            Err(_) => match readout(&line) {
+                Some(p) => drop(app.emit("dl", json!({"id": id, "kind": "progress", "p": p}))),
+                None if line.trim().is_empty() => {}
+                // the rest of aria2c's progress summary (see aria2())
+                None if [" *** ", "===", "---", "FILE: "].iter().any(|p| line.starts_with(p)) => {}
+                None => {
+                    if let Some((_, p)) = line.split_once("Download complete: ") {
+                        done = Some(p.trim().to_string());
+                    }
+                    last = line;
+                }
+            },
+        }
+    }
+    let stderr = errs.join().unwrap_or_default();
+    // cancel() removes the child, so a missing entry means the user stopped it
+    let child = app.state::<Jobs>().0.lock().unwrap().remove(&id);
+    match child.map(|mut c| c.wait()) {
+        None => None,
+        Some(Ok(s)) if s.success() => Some(Ok((done.unwrap_or(last), warnings(&stderr)))),
+        // aria2c reports errors on stdout
+        _ => Some(Err(last_error(&format!("{last}\n{stderr}")))),
+    }
+}
+
+fn finish(app: &AppHandle, id: u32, r: Outcome) {
+    let ev = match r {
+        None => json!({"id": id, "kind": "cancelled"}),
+        Some(Ok((path, warnings))) => json!({"id": id, "kind": "done", "path": path, "warnings": warnings}),
+        Some(Err(error)) => json!({"id": id, "kind": "failed", "error": error}),
+    };
+    let _ = app.emit("dl", ev);
 }
 
 #[tauri::command]
@@ -683,12 +1005,16 @@ pub fn run() {
         .manage(Pending::default())
         .invoke_handler(tauri::generate_handler![
             probe,
+            torrent_files,
             download,
             cancel,
             update_ytdlp,
             ytdlp_info,
             install_ytdlp,
             install_tools,
+            tool_versions,
+            update_tools,
+            route,
             list_sites,
             import_cookies,
             browsers,
@@ -739,6 +1065,62 @@ mod tests {
         assert_eq!(sha_in("nothing here", ""), None);
     }
 
+    #[test]
+    fn routes_every_rule() {
+        use Tool::*;
+        for (url, want) in [
+            ("magnet:?xt=urn:btih:abc&dn=Ubuntu", Aria2),
+            ("https://releases.ubuntu.com/x/ubuntu.iso.torrent?x=1", Aria2),
+            ("https://open.spotify.com/intl-de/track/abc", SpotDl),
+            ("https://open.spotify.com/playlist/abc?si=1", SpotDl),
+            ("https://cdn.example.com/live/master.m3u8?token=1", Nm3u8),
+            ("https://example.com/stream.MPD", Nm3u8),
+            ("https://www.twitch.tv/somechannel", Streamlink),
+            ("https://kick.com/somechannel", Streamlink),
+            ("https://www.youtube.com/@chan/live", Streamlink),
+            ("https://www.twitch.tv/videos/123", YtDlp),
+            ("https://www.instagram.com/p/abc/", GalleryDl),
+            ("https://imgur.com/a/abc", GalleryDl),
+            ("https://www.reddit.com/gallery/abc", GalleryDl),
+            ("https://x.com/u/status/1/photo/1", GalleryDl),
+            ("https://x.com/u/status/1", YtDlp),
+            ("https://example.com/files/setup.EXE", Aria2),
+            ("https://user:pw@example.com:8080/a.tar.gz#x", Aria2),
+            ("https://www.youtube.com/watch?v=abc.zip", YtDlp),
+            ("https://soundcloud.com/a/b", YtDlp),
+        ] {
+            assert_eq!(pick_tool(url), want, "{url}");
+        }
+    }
+
+    #[test]
+    fn reads_aria2_readout() {
+        let p = readout("[#2089b0 400.0KiB/33.2MiB(1%) CN:1 DL:115.7KiB ETA:1h4m51s]").unwrap();
+        assert_eq!(p["downloaded_bytes"], 409600.0);
+        assert_eq!(p["speed"], 115.7 * 1024.0);
+        assert_eq!(p["eta"], 3891);
+        assert_eq!(readout(" [#a 0B/0B CN:1 DL:0B](+1)").unwrap()["total_bytes"], 0.0);
+        assert_eq!(readout("[#a SEED(0.0) CN:0 SD:0]"), None);
+        assert_eq!(readout("/Users/x/file.mp4"), None);
+    }
+
+    #[test]
+    fn reads_torrents() {
+        let p = readout("[#a 2.0MiB/10MiB(20%) CN:40 SD:12 DL:1.0MiB UL:50KiB(1.0MiB) ETA:8s]").unwrap();
+        assert_eq!((p["peers"].clone(), p["seeds"].clone(), p["up"].clone()), (json!(40), json!(12), json!(51200.0)));
+        assert_eq!(p["ratio"], 0.5);
+        let s = "*** BitTorrent File Information ***\nComment: 7|x\nName: Big Show\nFiles:\nidx|path/length\n===+===\n  1|./Big Show/a|b.mkv\n   |1.1GiB (1,234,567,890)\n---+---\n 12|./Big Show/c.srt\n   |12KiB (12,288)\n---+---\n";
+        let (name, files) = torrent_list(s);
+        assert_eq!(name, "Big Show");
+        assert_eq!(
+            files,
+            [
+                json!({"index": 1, "path": "Big Show/a|b.mkv", "length": 1234567890u64}),
+                json!({"index": 12, "path": "Big Show/c.srt", "length": 12288})
+            ]
+        );
+    }
+
     // network: cargo test -- --ignored
     // needs a SOCKS5 proxy on 127.0.0.1:10808
     #[test]
@@ -762,8 +1144,11 @@ mod tests {
         assert!(t.elapsed().as_secs() < 3, "second yt-dlp start took {:?}", t.elapsed());
         fetch_ffmpeg(&dir).unwrap();
         fetch_deno(&dir).unwrap();
-        for n in ["ffmpeg", "ffprobe", "deno"] {
-            assert!(Command::new(dir.join(exe(n))).arg(if n == "deno" { "--version" } else { "-version" }).status().unwrap().success());
+        fetch_aria2(&dir).unwrap();
+        for n in ["ffmpeg", "ffprobe", "deno", "aria2c"] {
+            assert!(
+                Command::new(dir.join(exe(n))).arg(if n.starts_with("ff") { "-version" } else { "--version" }).status().unwrap().success()
+            );
         }
     }
 }

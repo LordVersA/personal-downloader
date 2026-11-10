@@ -23,6 +23,9 @@
         <input id="link" name="link" dir="auto" placeholder="Paste a link" autofocus spellcheck="false" />
         <button class="key" type="submit" id="fetch">Fetch</button>
       </form>
+      <details class="desc adv"><summary>Advanced</summary>
+        <label class="use">Use <select id="use" aria-label="Download with"><option value="">Auto</option><option value="yt-dlp">yt-dlp</option><option value="aria2c">aria2c</option></select></label>
+      </details>
       <p class="probe-log nums" id="probe-log" aria-live="polite" hidden></p>
       <p class="error" id="error" dir="auto" role="alert" hidden></p>
 
@@ -84,7 +87,7 @@
           <details class="desc cookie-sites-box" id="cookie-sites-box" hidden><summary id="cookie-sites-sum"></summary><span class="cookie-sites" id="cookie-sites"></span></details>
         </div>
       </div>
-      <h2 class="section">yt-dlp</h2>
+      <h2 class="section">Tools</h2>
       <div class="group card">
         <div class="setting">
           <span><span class="nums" id="ytdlp-ver">yt-dlp</span><small id="status">Checking…</small></span>
@@ -94,6 +97,13 @@
         <div class="setting">
           <span>Supported sites<small>Everything this yt-dlp can download from</small></span>
           <button class="btn" type="button" id="sites-btn">Show</button>
+        </div>
+        <div class="setting">
+          <span><span class="nums" id="tools-ver">ffmpeg · deno · aria2c</span><small id="tools-status">aria2c also downloads files and torrents; torrent peers can see your IP address while downloading</small></span>
+          <button class="btn" type="button" id="tools-update">Update all</button>
+        </div>
+        <div class="setting">
+          <label class="toggle"><input type="checkbox" id="fast" /><span>Faster downloads (aria2c)<small>Many connections per file; falls back to yt-dlp's own downloader if one fails. Not used with a SOCKS proxy</small></span></label>
         </div>
       </div>
       <h2 class="section">About</h2>
