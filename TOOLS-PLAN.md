@@ -79,11 +79,11 @@ Each phase ships as its own release.
 - [x] Download: `gallery-dl --cookies <cookies.txt> --proxy … -d <dir>`; progress = files done / total. *Each saved path (or "# path" for one already there) counts as a file; the total is the preview's count. History opens the files' folder. `PYTHONUNBUFFERED=1` is set, because Python holds back output written to a pipe.*
 
 ### Phase 4: Live (streamlink)
-- [ ] `uv tool install streamlink`.
-- [ ] Preview: `streamlink --json <url>` → quality list.
-- [ ] Record to `.ts`; track elapsed time and bytes; Stop = graceful kill that keeps the file; optional `--hls-duration`.
-- [ ] Live jobs run outside the one-at-a-time queue.
-- [ ] ffmpeg remux `.ts` → `.mp4` when done.
+- [x] `uv tool install streamlink`. *Same `ensure_tool` path as gallery-dl ("Getting live stream support…"), with its own Settings → Tools row. streamlink has no cookies.txt option, so subscriber-only streams aren't covered.*
+- [x] Preview: `streamlink --json <url>` → quality list. *Sorted best first (`1080p60`, `1080p`, … `audio_only`); `best`/`worst` aliases dropped. An offline channel (or one streamlink can't read) falls back to yt-dlp's probe unless streamlink was picked under Advanced.*
+- [x] Record to `.ts`; track elapsed time and bytes; Stop = graceful kill that keeps the file; optional `--hls-duration`. *The app reads `streamlink -O` and writes the file itself, counting bytes (and avoiding `-o`'s `{…}` templating of the path). Stop is the usual kill: the `.ts` up to that point is kept and saved. "Stop after [__] min" is the app's own timer instead of `--hls-duration`, which newer streamlink renamed. A stream that drops mid-way still saves what was recorded, with a warning.*
+- [x] Live jobs run outside the one-at-a-time queue. *They don't show in the Download-page strip or the tab badge; the Library row shows `LIVE ● 00:12:34 · 340 MB`.*
+- [x] ffmpeg remux `.ts` → `.mp4` when done. *`-n` never overwrites; if the remux fails, the `.ts` is kept with a warning. File name: `<channel> YYYY-MM-DD HH-MM-SS`.*
 
 ### Phase 5: Spotify (spotDL)
 - [ ] `uv tool install spotdl` (uses the app's ffmpeg via `--ffmpeg`).

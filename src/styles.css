@@ -265,6 +265,9 @@ input[type="radio"], input[type="checkbox"] { accent-color: var(--accent); width
   border-radius: 0 0 12px 12px;
 }
 .opts { flex: 1; min-width: 0; position: relative; }
+/* live: "Stop after [__] min" */
+.pick-foot label.grow { font-size: 12px; color: var(--label-2); }
+.pick-foot .search { width: 56px; margin: 0 4px; }
 .opts > summary { list-style: none; display: flex; gap: 8px; align-items: baseline; padding: 6px 8px; margin-left: -8px; border-radius: 7px; width: fit-content; max-width: 100%; }
 .opts > summary::-webkit-details-marker { display: none; }
 .opts > summary:hover { background: var(--hover); }

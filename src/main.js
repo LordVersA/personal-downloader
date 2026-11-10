@@ -273,6 +273,12 @@ pick.addEventListener("submit", (e) => {
     form.link.value = "";
     return closePick();
   }
+  if (pick.dataset.step === "live") {
+    const { url, title, author } = pick.live, quality = pick.q.value, minutes = Math.round(Math.max(0, Number(pick.minutes.value))) || null;
+    enqueue({ url, title, author, quality, minutes, label: quality, tool: "streamlink", live: true, opts: null });
+    form.link.value = "";
+    return closePick();
+  }
   if (pick.dataset.step === "torrent") {
     const { torrent, name, files } = pick.torrent, sel = torrentSel();
     if (!sel.length) return;
@@ -341,6 +347,7 @@ form.addEventListener("submit", async (e) => {
   const use = $("#use").value || (await invoke("route", { url }));
   if (use === "aria2c") return isTorrent(url) ? torrentPick(url) : filePick(url);
   if (use === "gallery-dl") return galleryPick(url, !!$("#use").value);
+  if (use === "streamlink") return livePick(url, !!$("#use").value);
   // a YouTube channel lists one tab at a time
   const base = url.match(CHANNEL)?.[1];
   fetchLink(base ? `${base}/videos` : url, base && { base, tab: "videos" });
@@ -453,6 +460,52 @@ async function galleryPick(url, forced) {
     <footer class="pick-foot"><span class="grow"></span><button class="key" type="submit">Download · ${plural(n, "file")}</button></footer>`;
   pick.firstElementChild.prepend(row("div", "item", null, name, [plural(n, "file")]));
   pick.file = { url, title: name, count: n };
+  pick.hidden = false;
+  renderHistory();
+}
+
+// A live channel: pick a quality, optionally a time limit, then Record. An offline channel or a link streamlink can't
+// read goes to yt-dlp unless the user picked streamlink in Advanced
+async function livePick(url, forced) {
+  if (probeId) invoke("cancel", { id: probeId });
+  closePick();
+  const id = (probeId = nextId++);
+  fetchBtn.classList.add("busy");
+  fetchBtn.textContent = "Fetching…";
+  logEl.textContent = "Looking for the live stream…";
+  logEl.hidden = false;
+  let s;
+  try {
+    s = await invoke("live_streams", { id, url, proxy: proxy() });
+    if (id !== probeId || !s) return;
+  } catch (err) {
+    if (id !== probeId) return;
+    if (forced) {
+      errorEl.innerHTML = errHtml(err);
+      errorEl.hidden = false;
+      return;
+    }
+  } finally {
+    if (id === probeId) {
+      probeId = 0;
+      logEl.hidden = true;
+      fetchBtn.classList.remove("busy");
+      fetchBtn.textContent = "Fetch";
+    }
+  }
+  if (!s?.qualities.length) return fetchLink(url);
+  pick.dataset.step = "live";
+  pick.live = { url, title: s.title || s.author || url, author: s.author || "Live" };
+  pick.innerHTML = `
+    <header class="pick-head">${btn("close", "Close", ICON.stop)}</header>
+    <div class="choices"><fieldset><legend>Quality</legend>${s.qualities.map((q, i) => `
+      <label class="opt"><input type="radio" name="q" value="${esc(q)}" ${i ? "" : "checked"} /><span class="q">${esc(q.replace("_", " "))}</span><span class="d"></span><span class="s"></span></label>`).join("")}
+    </fieldset></div>
+    <footer class="pick-foot">
+      <label class="grow">Stop after <input class="search nums" name="minutes" type="number" min="1" inputmode="numeric" placeholder="—" aria-label="Stop after minutes" /> min</label>
+      <button class="key" type="submit">Record</button>
+    </footer>`;
+  pick.firstElementChild.prepend(row("div", "item", null, pick.live.title, ["LIVE ●", esc(s.author ?? "")]));
   pick.hidden = false;
   renderHistory();
 }
@@ -610,13 +663,19 @@ function enqueue(...its) {
   renderQueue();
 }
 
+// file name for a recording: "Channel 2026-11-11 21-05-09", local time; set at start, so a retry gets a fresh name
+const stamp = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${d.toTimeString().slice(0, 8).replaceAll(":", "-")}`;
+
 async function pump() {
-  if (items.some((i) => i.status === "active")) return;
-  const it = items.find((i) => i.status === "queued");
+  // live recordings run alongside the one-at-a-time queue
+  const busy = items.some((i) => i.status === "active" && !i.live);
+  const it = items.find((i) => i.status === "queued" && (i.live || !busy));
   if (!it) return;
   Object.assign(it, { status: "active", p: null });
+  pump();
   try {
-    await invoke("download", { id: it.id, url: it.url, dir: it.dir ?? dir, proxy: proxy(), opts: it.opts, tool: it.tool ?? "yt-dlp", fast: $("#fast").checked, files: it.files ?? null });
+    await invoke("download", { id: it.id, url: it.url, dir: it.dir ?? dir, proxy: proxy(), opts: it.opts, tool: it.tool ?? "yt-dlp", fast: $("#fast").checked, files: it.files ?? null,
+      quality: it.quality ?? null, name: it.live ? `${it.author} ${stamp()}` : null, minutes: it.minutes ?? null });
   } catch (e) {
     fail(it, e);
     pump();
@@ -650,6 +709,7 @@ function metaOf(it) {
   if (it.status === "paused") return [esc(it.label), `${Math.floor(it.progress)}% · Paused`];
   const p = it.p;
   if (!p) return [esc(it.label), "Starting…"];
+  if (p.live) return [esc(it.label), `LIVE ● ${dur(p.elapsed)}`, mb(p.downloaded_bytes), it.minutes && `stops at ${it.minutes} min`];
   if (p.files_done) return [esc(it.label), `${p.files_done} of ${plural(it.count, "file")}`];
   const total = p.total_bytes ?? p.total_bytes_estimate;
   // torrents: "Seeds 12 · Peers 40 · ↑ 0.1 MB/s · ratio 0.1"
@@ -659,10 +719,10 @@ function metaOf(it) {
 
 function rowEl(it) {
   const active = it.status === "active";
-  const right = `<span class="percent nums">${active ? `${Math.floor(it.progress)}%` : ""}</span><span class="actions">` +
+  const right = `<span class="percent nums">${active && !it.live ? `${Math.floor(it.progress)}%` : ""}</span><span class="actions">` +
     (it.status === "failed" ? btn("retry", "Try again", ICON.retry) + btn("dismiss", "Dismiss", ICON.stop)
-      : (active ? btn("pause", "Pause", ICON.pause) : it.status === "paused" ? btn("resume", "Resume", ICON.play) : "") +
-        btn("stop", active ? "Stop download" : "Remove from queue", ICON.stop)) + "</span>";
+      : (active && !it.live ? btn("pause", "Pause", ICON.pause) : it.status === "paused" ? btn("resume", "Resume", ICON.play) : "") +
+        btn("stop", it.live && active ? "Stop recording" : active ? "Stop download" : "Remove from queue", ICON.stop)) + "</span>";
   const li = row("li", `item ${it.status}`, it.thumb, it.title, metaOf(it), right, active ? '<span class="tube"></span>' : "");
   li.dataset.id = it.id;
   if (it.status === "failed") li.querySelector(".meta").title = it.error;
@@ -671,8 +731,9 @@ function rowEl(it) {
 }
 
 // The strip on the Download page and the Library tab badge
+// shortcut: a recording shows only in the Library queue, not in the strip or badge; add a "● REC" state if people miss it
 function renderStatus() {
-  const act = items.find((i) => i.status === "active");
+  const act = items.find((i) => i.status === "active" && !i.live);
   const failed = items.filter((i) => i.status === "failed").length;
   const badge = $("#badge");
   badge.className = `badge nums${failed && !act ? " failed" : ""}`;
@@ -729,10 +790,11 @@ listen("dl", ({ payload: ev }) => {
     if (total) it.progress = Math.min(100, (p.downloaded_bytes / total) * 100);
     // galleries count files, against the number the preview found
     if (p.files_done) it.progress = Math.min(100, (p.files_done / it.count) * 100);
+    if (p.live) it.size = p.downloaded_bytes;
     const li = queue.querySelector(`[data-id="${it.id}"]`);
     if (li) {
       li.style.setProperty("--p", `${it.progress}%`);
-      li.querySelector(".percent").textContent = `${Math.floor(it.progress)}%`;
+      li.querySelector(".percent").textContent = it.live ? "" : `${Math.floor(it.progress)}%`;
       li.querySelector(".meta").innerHTML = metaHtml(metaOf(it));
     }
     return renderStatus();
@@ -949,7 +1011,7 @@ useBuiltin.addEventListener("click", () => busy(useBuiltin, "Downloading…", as
 const fastEl = $("#fast");
 fastEl.checked = store("fast") !== "0";
 fastEl.addEventListener("change", () => store("fast", fastEl.checked ? "1" : "0"));
-const UV_TOOLS = { "gallery-dl": "Images from Instagram, Pixiv, DeviantArt, Imgur, Reddit, Tumblr, X" };
+const UV_TOOLS = { "gallery-dl": "Images from Instagram, Pixiv, DeviantArt, Imgur, Reddit, Tumblr, X", streamlink: "Records live streams from Twitch, Kick and YouTube" };
 const uvRows = Object.entries(UV_TOOLS).map(([name, what]) => {
   const el = document.createElement("div");
   el.className = "setting";

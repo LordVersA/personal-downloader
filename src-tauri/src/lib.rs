@@ -1,10 +1,11 @@
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdout, Command, Stdio},
     sync::Mutex,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use velopack::{HttpOptions, UpdateCheck, UpdateInfo, UpdateManager, sources::HttpSource};
@@ -167,7 +168,7 @@ fn fetch_uv(dir: &std::path::Path) -> Result<(), String> {
 }
 
 // The Python tools uv may install; Settings → Tools lists them
-const UV_TOOLS: &[&str] = &["gallery-dl"];
+const UV_TOOLS: &[&str] = &["gallery-dl", "streamlink"];
 
 // uv with every path inside the app's own folders, its own Python only, and the app's proxy
 fn uv(app: &AppHandle, proxy: &str) -> Result<Command, String> {
@@ -199,13 +200,14 @@ fn ensure_tool(app: &AppHandle, name: &str, proxy: &str) -> Result<PathBuf, Stri
     }
     let what = match name {
         "gallery-dl" => "gallery",
+        "streamlink" => "live stream",
         _ => name,
     };
     let _ = app.emit("probe-log", format!("Getting {what} support… (first time only)"));
     if !bin_dir(app).join(exe("uv")).exists() {
         fetch_uv(&bin_dir(app))?;
     }
-    // pysocks lets gallery-dl use a SOCKS proxy
+    // pysocks lets the tool use a SOCKS proxy
     uv_run(app, proxy, &["tool", "install", "--force", name, "--with", "pysocks"])?;
     if exe_path.exists() { Ok(exe_path) } else { Err(format!("Couldn't install {name}")) }
 }
@@ -540,6 +542,145 @@ fn gallery_download(app: &AppHandle, id: u32, url: &str, dir: &str, proxy: &str)
     Ok(())
 }
 
+// streamlink with the app's proxy; it has no cookies.txt option
+// shortcut: signed-in-only streams (subscriber-only Twitch) need --twitch-api-header; add it if users ask
+fn streamlink(app: &AppHandle, proxy: &str) -> Result<Command, String> {
+    let mut cmd = tool(app, ensure_tool(app, "streamlink", proxy)?);
+    cmd.env("PYTHONUNBUFFERED", "1").env("PYTHONIOENCODING", "utf-8");
+    if !proxy.is_empty() {
+        cmd.args(["--http-proxy", proxy]);
+    }
+    Ok(cmd)
+}
+
+// A live channel's title, author and qualities (best first); null when cancelled. `--json` prints one JSON document
+// over many lines, with "error" set when the channel is offline
+#[tauri::command]
+async fn live_streams(app: AppHandle, id: u32, url: String, proxy: String) -> Result<Option<Value>, String> {
+    let mut cmd = streamlink(&app, &proxy)?;
+    cmd.args(["--json", "--"]).arg(&url);
+    let mut doc = String::new();
+    let r = watch(&app, id, start(&app, id, cmd)?, |line: &str| {
+        doc.push_str(line);
+        None
+    });
+    let Some(r) = r else { return Ok(None) };
+    let v: Value = serde_json::from_str(&doc).unwrap_or_default();
+    match (v["error"].as_str(), v["streams"].as_object()) {
+        (Some(e), _) => Err(e.to_string()),
+        (_, Some(s)) => Ok(Some(json!({"title": v["metadata"]["title"], "author": v["metadata"]["author"], "qualities": qualities(s)}))),
+        _ => Err(r.err().unwrap_or_else(|| "Couldn't read this live stream".into())),
+    }
+}
+
+// "1080p60" before "1080p" before "720p60" …, audio_only last; "best" and "worst" only repeat two of them
+fn qualities(streams: &serde_json::Map<String, Value>) -> Vec<&str> {
+    let rank = |n: &str| {
+        let (h, f) = n.split_once('p').unwrap_or((n, ""));
+        (h.parse::<u32>().unwrap_or(0), f.parse::<u32>().unwrap_or(0))
+    };
+    let mut q: Vec<&str> = streams.keys().map(String::as_str).filter(|k| !["best", "worst"].contains(k)).collect();
+    q.sort_by_key(|n| std::cmp::Reverse(rank(n)));
+    q
+}
+
+// Records until the stream ends, Stop, or `minutes`; the app writes streamlink's output itself, so it can count bytes
+// (and `-o` would read braces in the path as a template). Stopping keeps the recording; it's remuxed to .mp4 at the end
+#[allow(clippy::too_many_arguments)]
+fn live_download(
+    app: &AppHandle,
+    id: u32,
+    url: &str,
+    dir: &str,
+    proxy: &str,
+    quality: &str,
+    name: &str,
+    minutes: Option<u64>,
+) -> Result<(), String> {
+    // the name comes from the page (channel + time); keep it one safe file name
+    let name: String = name.chars().map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() || name.len() > 200 {
+        return Err("Invalid file name".into());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let ts = Path::new(dir).join(format!("{name}.ts"));
+    if ts.with_extension("mp4").exists() {
+        return Err("A recording with this name already exists".into());
+    }
+    let mut file = std::fs::File::create_new(&ts).map_err(|e| format!("Couldn't create the recording: {e}"))?;
+    let mut cmd = streamlink(app, proxy)?;
+    cmd.args(["-O", "--"]).arg(url).arg(quality);
+    let (mut out, mut err) = match start(app, id, cmd) {
+        Ok(io) => io,
+        Err(e) => {
+            let _ = std::fs::remove_file(&ts);
+            return Err(e);
+        }
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let errs = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = err.read_to_string(&mut s);
+            s
+        });
+        let (t0, mut tick, mut bytes, mut buf, mut wrote) = (Instant::now(), Instant::now(), 0u64, vec![0u8; 1 << 16], Ok(()));
+        while let Ok(n @ 1..) = out.read(&mut buf) {
+            if let Err(e) = file.write_all(&buf[..n]) {
+                wrote = Err(e);
+                cancel(app.state::<Jobs>(), id);
+                break;
+            }
+            bytes += n as u64;
+            if tick.elapsed() >= Duration::from_secs(1) {
+                tick = Instant::now();
+                let secs = t0.elapsed().as_secs();
+                let p = json!({"status": "downloading", "live": true, "elapsed": secs, "downloaded_bytes": bytes});
+                let _ = app.emit("dl", json!({"id": id, "kind": "progress", "p": p}));
+                if minutes.is_some_and(|m| secs >= m * 60) {
+                    cancel(app.state::<Jobs>(), id);
+                }
+            }
+        }
+        drop(file);
+        let stderr = errs.join().unwrap_or_default();
+        // cancel() removes the child: the user (or the timer) stopped it
+        let child = app.state::<Jobs>().0.lock().unwrap().remove(&id);
+        let ended = child.map(|mut c| c.wait().is_ok_and(|s| s.success()));
+        let r = if let Err(e) = wrote {
+            Some(Err(format!("Couldn't write the recording: {e}")))
+        } else if bytes == 0 {
+            let _ = std::fs::remove_file(&ts);
+            ended.map(|_| Err(last_error(&stderr)))
+        } else {
+            let mut warnings = Vec::new();
+            if ended == Some(false) {
+                warnings.push(format!("The recording ended early: {}", last_error(&stderr).lines().next().unwrap_or_default()));
+            }
+            // -n: never overwrite; on failure the .ts stays
+            let mp4 = ts.with_extension("mp4");
+            let ok = tool(&app, bin_dir(&app).join(exe("ffmpeg")))
+                .args(["-n", "-loglevel", "error", "-i"])
+                .arg(&ts)
+                .args(["-c", "copy"])
+                .arg(&mp4)
+                .status();
+            let path = if ok.is_ok_and(|s| s.success()) {
+                let _ = std::fs::remove_file(&ts);
+                mp4
+            } else {
+                let _ = std::fs::remove_file(&mp4);
+                warnings.push("Couldn't convert the recording to MP4; kept the .ts file".into());
+                ts
+            };
+            Some(Ok((path.to_string_lossy().into_owned(), warnings)))
+        };
+        finish(&app, id, r);
+    });
+    Ok(())
+}
+
 // Direct files and torrents. aria2c has no SOCKS support, and sending the download around the proxy would leak it
 // The caller adds its own options, then `--` and the link
 fn aria2(app: &AppHandle, dir: &Path, proxy: &str) -> Result<Command, String> {
@@ -675,12 +816,13 @@ fn pick_tool(url: &str) -> Tool {
 }
 
 // The tool the UI should use for this link.
-// shortcut: streamlink, spotDL and N_m3u8DL-RE arrive in later phases; until then their links go to yt-dlp
+// shortcut: spotDL and N_m3u8DL-RE arrive in later phases; until then their links go to yt-dlp
 #[tauri::command]
 fn route(url: String) -> &'static str {
     match pick_tool(&url) {
         Tool::Aria2 => "aria2c",
         Tool::GalleryDl => "gallery-dl",
+        Tool::Streamlink => "streamlink",
         _ => "yt-dlp",
     }
 }
@@ -881,7 +1023,7 @@ const DOWNLOAD_ARGS: &[&str] = &[
     "-P",
 ];
 
-// tool: "gallery-dl" for image galleries, "aria2c" for direct files and torrents (opts unused; files = "1,3", the torrent files to get), anything else is
+// tool: "streamlink" records a live stream (quality, name = file name without extension, minutes = stop after), "gallery-dl" for image galleries, "aria2c" for direct files and torrents (opts unused; files = "1,3", the torrent files to get), anything else is
 // yt-dlp; fast hands yt-dlp's plain HTTP downloads to aria2c, and a failure retries once with yt-dlp's own downloader
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -895,7 +1037,22 @@ fn download(
     tool: Option<String>,
     fast: Option<bool>,
     files: Option<String>,
+    quality: Option<String>,
+    name: Option<String>,
+    minutes: Option<u64>,
 ) -> Result<(), String> {
+    if tool.as_deref() == Some("streamlink") {
+        return live_download(
+            &app,
+            id,
+            &url,
+            &dir,
+            &proxy,
+            quality.as_deref().unwrap_or("best"),
+            name.as_deref().unwrap_or("Live"),
+            minutes,
+        );
+    }
     if tool.as_deref() == Some("gallery-dl") {
         return gallery_download(&app, id, &url, &dir, &proxy);
     }
@@ -1159,6 +1316,7 @@ pub fn run() {
             probe,
             torrent_files,
             gallery_files,
+            live_streams,
             remove_tool,
             download,
             cancel,
@@ -1245,6 +1403,12 @@ mod tests {
         ] {
             assert_eq!(pick_tool(url), want, "{url}");
         }
+    }
+
+    #[test]
+    fn orders_live_qualities() {
+        let s = json!({"audio_only": 0, "160p30": 0, "1080p": 0, "1080p60": 0, "720p60": 0, "best": 0, "worst": 0});
+        assert_eq!(qualities(s.as_object().unwrap()), ["1080p60", "1080p", "720p60", "160p30", "audio_only"]);
     }
 
     #[test]
