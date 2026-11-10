@@ -83,6 +83,9 @@ jobs:
           security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" > /dev/null
           rm "$RUNNER_TEMP/cert.p12"
+          # codesign resolves -s by name through the search list, even with --keychain
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$kc" # the name shown must be "Personal Downloader"
       - uses: actions/setup-dotnet@v4 # vpk runs on .NET 10
         with:
           dotnet-version: 10.0.x
