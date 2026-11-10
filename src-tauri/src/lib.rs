@@ -142,6 +142,82 @@ fn fetch_aria2(dir: &std::path::Path) -> Result<(), String> {
     unzip(dir, fetch(&format!("{base}/{file}"), |_| format!("{base}/SHA2-256SUMS"), file)?, &[exe("aria2c")])
 }
 
+// uv installs and runs the Python tools (gallery-dl, later streamlink and spotDL) with a Python of its own
+fn fetch_uv(dir: &std::path::Path) -> Result<(), String> {
+    let target = if cfg!(windows) {
+        "x86_64-pc-windows-msvc.zip"
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") { "aarch64-apple-darwin.tar.gz" } else { "x86_64-apple-darwin.tar.gz" }
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-gnu.tar.gz"
+    } else {
+        "x86_64-unknown-linux-gnu.tar.gz"
+    };
+    let url = format!("https://github.com/astral-sh/uv/releases/latest/download/uv-{target}");
+    let data = fetch(&url, |_| format!("{url}.sha256"), "")?;
+    if cfg!(windows) {
+        return unzip(dir, data, &[exe("uv")]);
+    }
+    // the archive holds uv-<target>/uv and uvx; tar ships with macOS and every Linux
+    let tmp = dir.join("uv.tar.gz");
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    let ok = Command::new("tar").arg("-xzf").arg(&tmp).arg("-C").arg(dir).arg("--strip-components=1").status().is_ok_and(|s| s.success());
+    let _ = std::fs::remove_file(tmp);
+    if ok { Ok(()) } else { Err("Couldn't unpack uv".into()) }
+}
+
+// The Python tools uv may install; Settings → Tools lists them
+const UV_TOOLS: &[&str] = &["gallery-dl"];
+
+// uv with every path inside the app's own folders, its own Python only, and the app's proxy
+fn uv(app: &AppHandle, proxy: &str) -> Result<Command, String> {
+    let data = app.path().app_data_dir().map_err(|e| e.to_string())?.join("uv");
+    let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("uv");
+    let mut cmd = tool(app, bin_dir(app).join(exe("uv")));
+    cmd.env("UV_TOOL_DIR", data.join("tools"))
+        .env("UV_TOOL_BIN_DIR", bin_dir(app))
+        .env("UV_PYTHON_INSTALL_DIR", data.join("python"))
+        .env("UV_CACHE_DIR", cache)
+        .env("UV_PYTHON_PREFERENCE", "only-managed");
+    if !proxy.is_empty() {
+        cmd.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy).env("ALL_PROXY", proxy);
+    }
+    Ok(cmd)
+}
+
+fn uv_run(app: &AppHandle, proxy: &str, args: &[&str]) -> Result<(), String> {
+    let o = uv(app, proxy)?.args(args).output().map_err(|e| format!("Couldn't start uv: {e}"))?;
+    if o.status.success() { Ok(()) } else { Err(last_error(&String::from_utf8_lossy(&o.stderr))) }
+}
+
+// Installs a Python tool the first time a link needs it (uv itself and a Python, ~50 MB, come along the first time)
+// shortcut: the install can't be cancelled and two first uses at once would both install; lock it if that ever happens
+fn ensure_tool(app: &AppHandle, name: &str, proxy: &str) -> Result<PathBuf, String> {
+    let exe_path = bin_dir(app).join(exe(name));
+    if exe_path.exists() {
+        return Ok(exe_path);
+    }
+    let what = match name {
+        "gallery-dl" => "gallery",
+        _ => name,
+    };
+    let _ = app.emit("probe-log", format!("Getting {what} support… (first time only)"));
+    if !bin_dir(app).join(exe("uv")).exists() {
+        fetch_uv(&bin_dir(app))?;
+    }
+    // pysocks lets gallery-dl use a SOCKS proxy
+    uv_run(app, proxy, &["tool", "install", "--force", name, "--with", "pysocks"])?;
+    if exe_path.exists() { Ok(exe_path) } else { Err(format!("Couldn't install {name}")) }
+}
+
+#[tauri::command]
+async fn remove_tool(app: AppHandle, name: String) -> Result<(), String> {
+    if !UV_TOOLS.contains(&name.as_str()) {
+        return Err("Unknown tool".into());
+    }
+    uv_run(&app, "", &["tool", "uninstall", &name])
+}
+
 // The app ships without yt-dlp, ffmpeg, deno and aria2c; fetch whichever are missing on first launch
 #[tauri::command]
 async fn install_tools(app: AppHandle) -> Result<(), String> {
@@ -177,16 +253,27 @@ async fn tool_versions(app: AppHandle) -> Value {
             .find(|w| w.starts_with(|c: char| c.is_ascii_digit()) || w.starts_with("N-"))
             .map(str::to_string)
     };
-    json!({"ffmpeg": v("ffmpeg", "-version"), "deno": v("deno", "--version"), "aria2c": v("aria2c", "--version")})
+    let mut out = json!({"ffmpeg": v("ffmpeg", "-version"), "deno": v("deno", "--version"), "aria2c": v("aria2c", "--version")});
+    for t in UV_TOOLS {
+        out[*t] = json!(v(t, "--version"));
+    }
+    out
 }
 
-// "Update all": yt-dlp only when a new release is out; ffmpeg and deno track "latest", so re-fetch them. aria2c is pinned
+// "Update all": yt-dlp only when a new release is out; ffmpeg and deno track "latest", so re-fetch them. aria2c is pinned.
+// The Python tools upgrade through uv
+// shortcut: uv itself stays at the version first fetched; re-fetch it here if a tool ever needs a newer uv
 #[tauri::command]
-async fn update_tools(app: AppHandle) -> Result<String, String> {
+async fn update_tools(app: AppHandle, proxy: String) -> Result<String, String> {
     let dir = bin_dir(&app);
     fetch_ffmpeg(&dir)?;
     fetch_deno(&dir)?;
-    update_ytdlp(app).await.map(|y| format!("{y}; ffmpeg and deno refreshed"))
+    let py = UV_TOOLS.iter().any(|t| dir.join(exe(t)).exists());
+    if py {
+        uv_run(&app, &proxy, &["tool", "upgrade", "--all"])?;
+    }
+    let y = update_ytdlp(app).await?;
+    Ok(format!("{y}; ffmpeg{} refreshed", if py { ", deno and the Python tools" } else { " and deno" }))
 }
 
 // (release zip, executable inside it); the unpacked build starts in ~0.2 s, the single-file one unpacks itself on every run (~14 s on macOS)
@@ -395,6 +482,64 @@ fn ytdlp(app: &AppHandle) -> Command {
     cmd
 }
 
+// gallery-dl with the app's cookies and proxy; Python buffers a pipe, so make it print each file as it happens
+fn gallery(app: &AppHandle, proxy: &str) -> Result<Command, String> {
+    let mut cmd = tool(app, ensure_tool(app, "gallery-dl", proxy)?);
+    cmd.env("PYTHONUNBUFFERED", "1").env("PYTHONIOENCODING", "utf-8");
+    if !proxy.is_empty() {
+        cmd.args(["--proxy", proxy]);
+    }
+    let cookies = cookies_file(app);
+    if cookies.exists() {
+        cmd.arg("--cookies").arg(cookies);
+    }
+    Ok(cmd)
+}
+
+// How many files a gallery link holds (-G prints one URL per file, "| " lines are fallbacks); null when cancelled
+// shortcut: a large profile is listed in full before the Download button shows; show the button early if that's too slow
+#[tauri::command]
+async fn gallery_files(app: AppHandle, id: u32, url: String, proxy: String) -> Result<Option<u64>, String> {
+    let mut cmd = gallery(&app, &proxy)?;
+    cmd.args(["-G", "--"]).arg(&url);
+    let mut n = 0u64;
+    let count = |line: &str| -> Option<Value> {
+        if !line.trim().is_empty() && !line.starts_with("| ") {
+            n += 1;
+            let _ = app.emit("probe-log", format!("Found {n} files…"));
+        }
+        None
+    };
+    match watch(&app, id, start(&app, id, cmd)?, count) {
+        None => Ok(None),
+        Some(Err(e)) => Err(e),
+        Some(Ok(_)) => Ok(Some(n)),
+    }
+}
+
+// gallery-dl prints each file's path as it saves it ("# path" when it was already there); history keeps their folder
+fn gallery_download(app: &AppHandle, id: u32, url: &str, dir: &str, proxy: &str) -> Result<(), String> {
+    let mut cmd = gallery(app, proxy)?;
+    cmd.arg("-d").arg(dir).arg("--").arg(url);
+    let io = start(app, id, cmd)?;
+    let (app, dir) = (app.clone(), dir.to_string());
+    std::thread::spawn(move || {
+        let (mut n, mut last) = (0u64, String::new());
+        let r = watch(&app, id, io, |line: &str| {
+            let path = line.trim().trim_start_matches("# ");
+            if path.is_empty() {
+                return None;
+            }
+            n += 1;
+            last = path.to_string();
+            Some(json!({"status": "downloading", "files_done": n}))
+        });
+        let folder = Path::new(&last).parent().map_or(dir, |p| p.to_string_lossy().into_owned());
+        finish(&app, id, r.map(|r| r.map(|(_, w)| (folder, w))));
+    });
+    Ok(())
+}
+
 // Direct files and torrents. aria2c has no SOCKS support, and sending the download around the proxy would leak it
 // The caller adds its own options, then `--` and the link
 fn aria2(app: &AppHandle, dir: &Path, proxy: &str) -> Result<Command, String> {
@@ -407,11 +552,13 @@ fn aria2(app: &AppHandle, dir: &Path, proxy: &str) -> Result<Command, String> {
     }
     let mut cmd = tool(app, exe);
     // -c resumes the .aria2 control file, so pause (a kill) and resume work; --seed-time=0: never upload after finishing.
+    // --follow-*=false: a direct link that serves a .torrent or metalink must not turn into a peer download around the proxy
     // Into a pipe aria2c only flushes its progress line along with the summary, so print that every second
     #[rustfmt::skip]
     cmd.args([
         "--no-conf", "-c", "--console-log-level=notice", "--summary-interval=1", "--download-result=hide",
         "--file-allocation=none", "-x16", "-s16", "--min-split-size=1M", "--seed-time=0", "--auto-file-renaming=true",
+        "--follow-torrent=false", "--follow-metalink=false",
     ]);
     cmd.arg("--dir").arg(dir);
     if !proxy.is_empty() {
@@ -433,9 +580,9 @@ async fn torrent_files(app: AppHandle, id: u32, url: String, proxy: String) -> R
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut cmd = aria2(&app, &dir, &proxy)?;
-    cmd.args(["--bt-metadata-only=true", "--bt-save-metadata=true", "--follow-torrent=false", "--"]).arg(&url);
+    cmd.args(["--bt-metadata-only=true", "--bt-save-metadata=true", "--"]).arg(&url);
     // shortcut: a magnet nobody seeds waits until the user fetches something else; add a timeout if that confuses people
-    match watch(&app, id, start(&app, id, cmd)?) {
+    match watch(&app, id, start(&app, id, cmd)?, readout) {
         None => return Ok(Value::Null),
         Some(Err(e)) => return Err(e),
         Some(Ok(_)) => {}
@@ -528,11 +675,12 @@ fn pick_tool(url: &str) -> Tool {
 }
 
 // The tool the UI should use for this link.
-// shortcut: gallery-dl, streamlink, spotDL and N_m3u8DL-RE arrive in later phases; until then their links go to yt-dlp
+// shortcut: streamlink, spotDL and N_m3u8DL-RE arrive in later phases; until then their links go to yt-dlp
 #[tauri::command]
 fn route(url: String) -> &'static str {
     match pick_tool(&url) {
         Tool::Aria2 => "aria2c",
+        Tool::GalleryDl => "gallery-dl",
         _ => "yt-dlp",
     }
 }
@@ -733,7 +881,7 @@ const DOWNLOAD_ARGS: &[&str] = &[
     "-P",
 ];
 
-// tool: "aria2c" for direct files and torrents (opts unused; files = "1,3", the torrent files to get), anything else is
+// tool: "gallery-dl" for image galleries, "aria2c" for direct files and torrents (opts unused; files = "1,3", the torrent files to get), anything else is
 // yt-dlp; fast hands yt-dlp's plain HTTP downloads to aria2c, and a failure retries once with yt-dlp's own downloader
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -748,6 +896,9 @@ fn download(
     fast: Option<bool>,
     files: Option<String>,
 ) -> Result<(), String> {
+    if tool.as_deref() == Some("gallery-dl") {
+        return gallery_download(&app, id, &url, &dir, &proxy);
+    }
     if tool.as_deref() == Some("aria2c") {
         let mut cmd = aria2(&app, Path::new(&dir), &proxy)?;
         if let Some(f) = files {
@@ -758,7 +909,7 @@ fn download(
         }
         cmd.arg("--").arg(&url);
         let io = start(&app, id, cmd)?;
-        std::thread::spawn(move || finish(&app, id, watch(&app, id, io)));
+        std::thread::spawn(move || finish(&app, id, watch(&app, id, io, readout)));
         return Ok(());
     }
     let opts = opts.ok_or("No download options")?;
@@ -766,10 +917,10 @@ fn download(
     let fast = fast.unwrap_or(true) && !proxy.starts_with("socks") && bin_dir(&app).join(exe("aria2c")).exists();
     let io = start(&app, id, ytdlp_download(&app, &url, &dir, &proxy, &opts, fast)?)?;
     std::thread::spawn(move || {
-        let mut r = watch(&app, id, io);
+        let mut r = watch(&app, id, io, readout);
         if fast && matches!(r, Some(Err(_))) {
             r = match ytdlp_download(&app, &url, &dir, &proxy, &opts, false).and_then(|c| start(&app, id, c)) {
-                Ok(io) => watch(&app, id, io),
+                Ok(io) => watch(&app, id, io, readout),
                 Err(e) => Some(Err(e)),
             };
         }
@@ -845,7 +996,8 @@ fn start(app: &AppHandle, id: u32, mut cmd: Command) -> Result<(ChildStdout, Chi
 
 // Streams progress until the job exits: Ok((path, warnings)), Err(explained error), or None when the user stopped it
 type Outcome = Option<Result<(String, Vec<String>), String>>;
-fn watch(app: &AppHandle, id: u32, (out, mut err): (ChildStdout, ChildStderr)) -> Outcome {
+// `parse` turns a tool's own progress line into a progress event
+fn watch(app: &AppHandle, id: u32, (out, mut err): (ChildStdout, ChildStderr), mut parse: impl FnMut(&str) -> Option<Value>) -> Outcome {
     let errs = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = err.read_to_string(&mut s);
@@ -857,7 +1009,7 @@ fn watch(app: &AppHandle, id: u32, (out, mut err): (ChildStdout, ChildStderr)) -
         match serde_json::from_str::<Value>(&line) {
             Ok(p) if p.get("status").is_some() => drop(app.emit("dl", json!({"id": id, "kind": "progress", "p": p}))),
             Ok(info) => drop(app.emit("dl", json!({"id": id, "kind": "info", "info": info}))),
-            Err(_) => match readout(&line) {
+            Err(_) => match parse(&line) {
                 Some(p) => drop(app.emit("dl", json!({"id": id, "kind": "progress", "p": p}))),
                 None if line.trim().is_empty() => {}
                 // the rest of aria2c's progress summary (see aria2())
@@ -1006,6 +1158,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             probe,
             torrent_files,
+            gallery_files,
+            remove_tool,
             download,
             cancel,
             update_ytdlp,
@@ -1129,6 +1283,15 @@ mod tests {
         let r = tauri::async_runtime::block_on(test_proxy("socks5://127.0.0.1:10808".into()));
         println!("{r:?}");
         assert!(r.is_ok());
+    }
+
+    #[test]
+    #[ignore]
+    fn fetches_uv() {
+        let dir = std::env::temp_dir().join("pd-uv-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        fetch_uv(&dir).unwrap();
+        assert!(Command::new(dir.join(exe("uv"))).arg("--version").status().unwrap().success());
     }
 
     #[test]

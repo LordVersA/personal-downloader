@@ -267,8 +267,9 @@ document.addEventListener("pointerdown", (e) => { const d = pick.querySelector("
 pick.addEventListener("submit", (e) => {
   e.preventDefault();
   if (pick.dataset.step === "list") return; // Enter in the list's search field
-  if (pick.dataset.step === "file") {
-    enqueue({ ...pick.file, label: "File", tool: "aria2c", opts: null });
+  if (pick.dataset.step === "file" || pick.dataset.step === "gallery") {
+    const g = pick.dataset.step === "gallery";
+    enqueue({ ...pick.file, label: g ? "Images" : "File", tool: g ? "gallery-dl" : "aria2c", opts: null });
     form.link.value = "";
     return closePick();
   }
@@ -336,8 +337,10 @@ form.addEventListener("submit", async (e) => {
     return;
   }
   infoUrl = url;
-  // direct files and torrents skip yt-dlp's probe; the Advanced "Use" menu overrides the router
-  if (($("#use").value || (await invoke("route", { url }))) === "aria2c") return isTorrent(url) ? torrentPick(url) : filePick(url);
+  // direct files, torrents and galleries skip yt-dlp's probe; the Advanced "Use" menu overrides the router
+  const use = $("#use").value || (await invoke("route", { url }));
+  if (use === "aria2c") return isTorrent(url) ? torrentPick(url) : filePick(url);
+  if (use === "gallery-dl") return galleryPick(url, !!$("#use").value);
   // a YouTube channel lists one tab at a time
   const base = url.match(CHANNEL)?.[1];
   fetchLink(base ? `${base}/videos` : url, base && { base, tab: "videos" });
@@ -409,6 +412,51 @@ function filePick(url) {
   renderHistory();
 }
 
+// An image gallery: count its files, then one Download button. A link gallery-dl can't read goes to yt-dlp unless
+// the user picked gallery-dl in Advanced
+async function galleryPick(url, forced) {
+  if (probeId) invoke("cancel", { id: probeId });
+  closePick();
+  const id = (probeId = nextId++);
+  fetchBtn.classList.add("busy");
+  fetchBtn.textContent = "Fetching…";
+  logEl.textContent = "Looking for images…";
+  logEl.hidden = false;
+  let n;
+  try {
+    n = await invoke("gallery_files", { id, url, proxy: proxy() });
+    if (id !== probeId || n == null) return;
+    if (!n && forced) throw "There's nothing to download at this link.";
+  } catch (err) {
+    if (id !== probeId) return;
+    if (forced) {
+      errorEl.innerHTML = errHtml(err);
+      errorEl.hidden = false;
+      return;
+    }
+  } finally {
+    if (id === probeId) {
+      probeId = 0;
+      logEl.hidden = true;
+      fetchBtn.classList.remove("busy");
+      fetchBtn.textContent = "Fetch";
+    }
+  }
+  if (!n) return fetchLink(url);
+  let name = url;
+  try {
+    const u = new URL(url);
+    name = `${u.hostname.replace(/^www\./, "")}${u.pathname.replace(/\/$/, "")}`;
+  } catch {}
+  pick.dataset.step = "gallery";
+  pick.innerHTML = `<header class="pick-head">${btn("close", "Close", ICON.stop)}</header>
+    <footer class="pick-foot"><span class="grow"></span><button class="key" type="submit">Download · ${plural(n, "file")}</button></footer>`;
+  pick.firstElementChild.prepend(row("div", "item", null, name, [plural(n, "file")]));
+  pick.file = { url, title: name, count: n };
+  pick.hidden = false;
+  renderHistory();
+}
+
 const isTorrent = (url) => url.startsWith("magnet:") || /\.torrent$/i.test(url.split(/[?#]/)[0]);
 
 // A torrent: fetch its metadata (magnets need peers for that), then tick the files to get
@@ -434,7 +482,9 @@ async function torrentPick(url) {
         <button class="link-btn" type="button" data-act="none">None</button>
       </div>
       <div class="list entries"></div>
-      <footer class="pick-foot"><span class="grow"></span><button class="key" type="submit"></button></footer>`;
+      <footer class="pick-foot"><small class="grow"></small><button class="key" type="submit"></button></footer>`;
+    // aria2c sends only tracker and web-seed traffic through an HTTP proxy
+    if (proxy()) pick.querySelector(".pick-foot small").textContent = "Peers connect directly, not through your proxy";
     pick.querySelector(".list-title").textContent = t.name;
     pick.querySelector(".entries").append(...t.files.map((f, i) =>
       row("label", "item entry", null, f.path, [mb(f.length)], `<input type="checkbox" value="${i}" checked />`)));
@@ -600,6 +650,7 @@ function metaOf(it) {
   if (it.status === "paused") return [esc(it.label), `${Math.floor(it.progress)}% · Paused`];
   const p = it.p;
   if (!p) return [esc(it.label), "Starting…"];
+  if (p.files_done) return [esc(it.label), `${p.files_done} of ${plural(it.count, "file")}`];
   const total = p.total_bytes ?? p.total_bytes_estimate;
   // torrents: "Seeds 12 · Peers 40 · ↑ 0.1 MB/s · ratio 0.1"
   const swarm = p.seeds != null && [`Seeds ${p.seeds}`, `Peers ${p.peers ?? 0}`, p.up && `↑ ${mb(p.up)}/s`, p.ratio != null && `ratio ${p.ratio.toFixed(1)}`];
@@ -676,6 +727,8 @@ listen("dl", ({ payload: ev }) => {
     const total = p.total_bytes ?? p.total_bytes_estimate;
     // shortcut: video+audio downloads report two passes, so the bar refills once; weight the passes if it bothers anyone
     if (total) it.progress = Math.min(100, (p.downloaded_bytes / total) * 100);
+    // galleries count files, against the number the preview found
+    if (p.files_done) it.progress = Math.min(100, (p.files_done / it.count) * 100);
     const li = queue.querySelector(`[data-id="${it.id}"]`);
     if (li) {
       li.style.setProperty("--p", `${it.progress}%`);
@@ -892,19 +945,37 @@ useBuiltin.addEventListener("click", () => busy(useBuiltin, "Downloading…", as
   await refreshYtdlp(note);
 }));
 
-// ffmpeg, deno and aria2c versions; "Update all" also runs the yt-dlp check
+// ffmpeg, deno and aria2c versions, plus a row per Python tool; "Update all" also runs the yt-dlp check
 const fastEl = $("#fast");
 fastEl.checked = store("fast") !== "0";
 fastEl.addEventListener("change", () => store("fast", fastEl.checked ? "1" : "0"));
+const UV_TOOLS = { "gallery-dl": "Images from Instagram, Pixiv, DeviantArt, Imgur, Reddit, Tumblr, X" };
+const uvRows = Object.entries(UV_TOOLS).map(([name, what]) => {
+  const el = document.createElement("div");
+  el.className = "setting";
+  el.innerHTML = `<span><span class="nums"></span><small></small></span><button class="btn" type="button" hidden>Remove</button>`;
+  el.querySelector("small").textContent = what;
+  el.querySelector("button").addEventListener("click", () => busy(el.querySelector("button"), "Removing…", async () => {
+    if (items.some((i) => i.status === "active" && i.tool === name)) return (el.querySelector("small").textContent = "Wait for its downloads to finish.");
+    await invoke("remove_tool", { name }).catch((e) => (el.querySelector("small").textContent = String(e)));
+    await refreshTools();
+  }));
+  return [name, el];
+});
+fastEl.closest(".setting").before(...uvRows.map(([, el]) => el));
 async function refreshTools() {
   const v = await invoke("tool_versions").catch(() => ({}));
   $("#tools-ver").textContent = ["ffmpeg", "deno", "aria2c"].map((n) => `${n} ${v[n] ?? "missing"}`).join(" · ");
+  for (const [name, el] of uvRows) {
+    el.querySelector(".nums").textContent = v[name] ? `${name} ${v[name]}` : `${name} · installs on first use`;
+    el.querySelector("button").hidden = !v[name];
+  }
 }
 $("#tools-update").addEventListener("click", () => busy($("#tools-update"), "Updating…", async () => {
   // a running download holds ffmpeg and yt-dlp open; Windows can't replace them then
   if (items.some((i) => i.status === "active")) return ($("#tools-status").textContent = "Wait for downloads to finish, then update.");
   $("#tools-status").textContent = "Downloading the latest yt-dlp, ffmpeg and deno…";
-  $("#tools-status").textContent = await invoke("update_tools").catch(String);
+  $("#tools-status").textContent = await invoke("update_tools", { proxy: proxy() }).catch(String);
   await Promise.all([refreshTools(), refreshYtdlp()]);
 }));
 

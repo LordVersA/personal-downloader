@@ -54,11 +54,11 @@ Each phase ships as its own release.
 ## Tasks
 
 ### Phase 1: Foundation
-- [ ] `lib.rs`: generalize `fetch_*` into a per-tool install (`ensure_tool(name)`) that reuses `fetch()`, the sha check, `put()` and `unzip()`. *Deferred to Phase 3: no tool installs on demand until gallery-dl. `fetch_aria2` reuses `fetch()`/`unzip()`, and the shared `tool()` command builder replaces the yt-dlp-only one.*
+- [x] `lib.rs`: generalize `fetch_*` into a per-tool install (`ensure_tool(name)`) that reuses `fetch()`, the sha check, `put()` and `unzip()`. *Done in Phase 3: `ensure_tool` installs a Python tool through uv on first use; `fetch_uv` reuses `fetch()`/`unzip()`.*
 - [x] `lib.rs`: fetch aria2c in `install_tools` at first launch. *Sources: `.github/workflows/aria2.yml` builds macOS (universal, system libs only) from the official 1.37.0 source, mirrors official Windows and abcfy2 static Linux after pinned SHA-256 checks, and publishes them with `SHA2-256SUMS` as the non-latest release `aria2-1.37.0`. **Run that workflow once before shipping.***
 - [x] `lib.rs`: `pick_tool(url) -> Tool` implementing the rules table, plus a unit test covering every row. *`route` maps it to aria2c / yt-dlp until the other tools land.*
 - [x] `lib.rs`: `download` takes an optional `tool` override and dispatches on `Tool`. Today's yt-dlp path is unchanged.
-- [ ] `lib.rs`: fallback to yt-dlp on failure, per the rules table. *Deferred to Phase 3: no Phase 1 route has a fallback (aria2c's is "none").*
+- [x] `lib.rs`: fallback to yt-dlp on failure, per the rules table. *Done in Phase 3, at the preview: a gallery link that gallery-dl can't read (an error or 0 files) goes to yt-dlp's probe, unless gallery-dl was picked under Advanced. A failed gallery download doesn't retry with yt-dlp, since yt-dlp needs its own format choice first.*
 - [x] `lib.rs`: yt-dlp `--downloader http:aria2c`; on failure, retry once without it. Setting `fastDownloads` (default on). *Skipped automatically with a SOCKS proxy, which aria2c can't use.*
 - [x] **Verify:** is yt-dlp's `%(progress)j` progress still accurate with aria2c? *No: yt-dlp's external downloader reports only "finished". aria2c's own readout is parsed instead (`readout()`), with `--summary-interval=1`, because aria2c doesn't flush its readout into a pipe otherwise.*
 - [x] `lib.rs`: aria2c for direct files. *Progress comes from the console readout rather than RPC, which is less code. RPC moves to Phase 2, where file selection and peers need it. Magnets and .torrent links already download (no seeding, no file picker).*
@@ -73,10 +73,10 @@ Each phase ships as its own release.
 - [x] Queue item: "Seeds 12 · Peers 40 · ↑ 0.1 MB/s · ratio 0.1". *"Fetching metadata from peers…" shows under the link box during the preview instead, because the file list has to exist before anything is queued.*
 
 ### Phase 3: Images (uv + gallery-dl)
-- [ ] `ensure_tool("uv")`: fetch the uv binary; set `UV_TOOL_DIR` / `UV_TOOL_BIN_DIR` / `UV_PYTHON_INSTALL_DIR` inside the app data dir.
-- [ ] `uv tool install gallery-dl`; Tools list update = `uv tool upgrade`.
-- [ ] Preview: `gallery-dl --simulate` → file count.
-- [ ] Download: `gallery-dl --cookies <cookies.txt> --proxy … -d <dir>`; progress = files done / total.
+- [x] `ensure_tool("uv")`: fetch the uv binary; set `UV_TOOL_DIR` / `UV_TOOL_BIN_DIR` / `UV_PYTHON_INSTALL_DIR` inside the app data dir. *Also `UV_CACHE_DIR` (app cache), `UV_PYTHON_PREFERENCE=only-managed` (never a system Python), and the app's proxy as `HTTP(S)_PROXY`/`ALL_PROXY`. Measured: Python 71 MB + gallery-dl 7 MB.*
+- [x] `uv tool install gallery-dl`; Tools list update = `uv tool upgrade`. *Installed `--with pysocks` so SOCKS proxies work. Settings → Tools has a gallery-dl row ("installs on first use" or its version, plus Remove = `uv tool uninstall`). "Update all" runs `uv tool upgrade --all` when a Python tool is installed. The status line under the link box shows "Getting gallery support… (first time only)" during the install.*
+- [x] Preview: `gallery-dl --simulate` → file count. *`-G` (one URL per file, "| " lines are fallbacks) instead, so the count streams in as "Found n files…".*
+- [x] Download: `gallery-dl --cookies <cookies.txt> --proxy … -d <dir>`; progress = files done / total. *Each saved path (or "# path" for one already there) counts as a file; the total is the preview's count. History opens the files' folder. `PYTHONUNBUFFERED=1` is set, because Python holds back output written to a pipe.*
 
 ### Phase 4: Live (streamlink)
 - [ ] `uv tool install streamlink`.
