@@ -1,0 +1,63 @@
+name: aria2c
+
+# Run once (Actions → aria2c → Run workflow). Publishes the aria2c the app fetches on first launch as the
+# non-latest release "aria2-1.37.0": aria2 ships no macOS build and no checksums, so macOS is built here from the
+# official source and the Windows (official) and Linux (abcfy2 static) builds are mirrored after a pinned SHA-256 check.
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-15
+    env:
+      V: 1.37.0
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download and verify
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://github.com/aria2/aria2/releases/download/release-$V/aria2-$V.tar.xz"
+          curl -fsSLo win.zip "https://github.com/aria2/aria2/releases/download/release-$V/aria2-$V-win-64bit-build1.zip"
+          curl -fsSLo linux-x86_64.zip "https://github.com/abcfy2/aria2-static-build/releases/download/$V/aria2-x86_64-linux-musl_static.zip"
+          curl -fsSLo linux-aarch64.zip "https://github.com/abcfy2/aria2-static-build/releases/download/$V/aria2-aarch64-linux-musl_static.zip"
+          shasum -a 256 -c <<'EOF'
+          60a420ad7085eb616cb6e2bdf0a7206d68ff3d37fb5a956dc44242eb2f79b66b  aria2-1.37.0.tar.xz
+          67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288  win.zip
+          e0a09b12ef67f35f8a8e4fdddbec851d235b7c31da549d0578bff459032b499a  linux-x86_64.zip
+          0c681a89a40e0f82d1f5137608e86257eb0af201459c002941ea098f2b8c26b6  linux-aarch64.zip
+          EOF
+
+      # universal binary that links only system libraries (AppleTLS, zlib); Homebrew is kept out of PATH and pkg-config
+      - name: Build macOS
+        run: |
+          set -euo pipefail
+          tar -xJf "aria2-$V.tar.xz"
+          cd "aria2-$V"
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin PKG_CONFIG_LIBDIR=/nonexistent
+          A="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
+          ./configure --with-appletls --without-openssl --without-gnutls --without-libssh2 --without-libcares \
+            --without-sqlite3 --without-libgcrypt --without-libnettle --without-libgmp --without-libxml2 \
+            --without-libexpat --disable-nls CC="clang $A" CXX="clang++ $A" CFLAGS=-O2 CXXFLAGS=-O2 LDFLAGS="$A"
+          make -j"$(sysctl -n hw.ncpu)"
+          strip src/aria2c
+          codesign -s - -f src/aria2c
+          lipo src/aria2c -verify_arch arm64 x86_64
+          if otool -L src/aria2c | grep -E '^\s' | grep -vE '/usr/lib/|/System/Library/'; then echo "links non-system libraries"; exit 1; fi
+          src/aria2c --version | head -1
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          mkdir out w
+          zip -j out/aria2c-macos.zip "aria2-$V/src/aria2c"
+          unzip -j win.zip '*/aria2c.exe' -d w
+          zip -j out/aria2c-windows-x86_64.zip w/aria2c.exe
+          cp linux-x86_64.zip out/aria2c-linux-x86_64.zip
+          cp linux-aarch64.zip out/aria2c-linux-aarch64.zip
+          cd out
+          shasum -a 256 * > SHA2-256SUMS
+          # --latest=false: the app's updater reads releases/latest
+          gh release create "aria2-$V" --repo "$GITHUB_REPOSITORY" --latest=false --title "aria2c $V" \
+            --notes "aria2c fetched by the app at first launch. Not an app release." *
