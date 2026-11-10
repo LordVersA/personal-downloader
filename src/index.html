@@ -72,13 +72,16 @@
           <input class="search" id="proxy-user" type="text" placeholder="Username (optional)" aria-label="Proxy username" spellcheck="false" autocomplete="off" />
           <input class="search" id="proxy-pass" type="password" placeholder="Password (optional)" aria-label="Proxy password" autocomplete="off" />
         </div>
-        <div class="setting"><span>Browser cookies<small id="cookie-status">Sign-in for YouTube, Instagram, X and other sites</small><span class="cookie-sites" id="cookie-sites"></span></span>
-          <button class="btn" type="button" id="cookie-remove" hidden>Remove</button>
-          <select id="cookie-browser" aria-label="Browser to import cookies from">
-            <option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option><option value="edge">Edge</option>
-            <option value="brave">Brave</option><option value="opera">Opera</option><option value="vivaldi">Vivaldi</option><option value="chromium">Chromium</option><option value="whale">Whale</option>
-          </select>
-          <button class="btn" type="button" id="cookie-import">Import</button>
+        <div class="setting cookies">
+          <div class="cookie-head">
+            <span>Browser cookies<small id="cookie-status" dir="auto"></small></span>
+            <button class="link-btn danger" type="button" id="cookie-remove" hidden>Remove</button>
+          </div>
+          <div class="cookie-pick">
+            <div class="browsers" id="cookie-browser" role="radiogroup" aria-label="Browser to import cookies from"></div>
+            <button class="btn primary" type="button" id="cookie-import">Import</button>
+          </div>
+          <details class="desc cookie-sites-box" id="cookie-sites-box" hidden><summary id="cookie-sites-sum"></summary><span class="cookie-sites" id="cookie-sites"></span></details>
         </div>
       </div>
       <h2 class="section">yt-dlp</h2>
@@ -118,9 +121,9 @@
       <h2>Sign-in needed</h2>
       <p id="ask-why" dir="auto"></p>
       <p class="ask-note">Import your browser's cookies so yt-dlp downloads as you, signed in. Sign in to the site in that browser first.</p>
+      <div class="browsers" id="ask-browser" role="radiogroup" aria-label="Browser to import cookies from"></div>
       <small id="ask-status" dir="auto"></small>
       <div class="ask-row">
-        <select id="ask-browser" aria-label="Browser to import cookies from"></select>
         <span class="grow"></span>
         <button class="btn" type="button" id="ask-cancel">Not now</button>
         <button class="btn primary" type="button" id="ask-import">Import &amp; retry</button>

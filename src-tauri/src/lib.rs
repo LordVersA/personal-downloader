@@ -186,7 +186,7 @@ fn cookies_file(app: &AppHandle) -> PathBuf {
 
 // Copies the browser's cookies (all sites) into cookies.txt; yt-dlp saves the jar on exit even though it then complains there's no URL
 #[tauri::command]
-async fn import_cookies(app: AppHandle, browser: String) -> Result<String, String> {
+async fn import_cookies(app: AppHandle, browser: String) -> Result<usize, String> {
     let (to, tmp) = (cookies_file(&app), cookies_file(&app).with_extension("txt.part"));
     let _ = std::fs::remove_file(&tmp);
     // owner-only before yt-dlp writes login sessions into it; the mode survives its truncating writes and the rename.
@@ -215,7 +215,7 @@ async fn import_cookies(app: AppHandle, browser: String) -> Result<String, Strin
         return Err(err);
     }
     std::fs::rename(&tmp, &to).map_err(|e| e.to_string())?;
-    Ok(format!("{n} cookies from {browser}"))
+    Ok(n)
 }
 
 // Main domain of a cookie line ("#HttpOnly_.www.youtube.com\t…" → ("youtube.com", "youtube")); handles two-part suffixes like co.uk
@@ -253,6 +253,50 @@ async fn cookie_sites(app: AppHandle) -> Result<Vec<String>, String> {
     sites.sort();
     sites.dedup();
     Ok(sites)
+}
+
+// Browsers on this computer yt-dlp can import from: the profile folder it reads cookies from must exist, and on macOS
+// the app too, since uninstalling leaves the folder behind.
+// shortcut: Windows and Linux check the folder only; add an install check if leftover folders confuse people there
+#[tauri::command]
+fn browsers(app: AppHandle) -> Vec<&'static str> {
+    let p = app.path();
+    let [home, local, roaming, config] = [p.home_dir(), p.local_data_dir(), p.data_dir(), p.config_dir()].map(|d| d.unwrap_or_default());
+    let mac = cfg!(target_os = "macos");
+    // (id, macOS apps, profile folder: macOS under Application Support, Windows, Linux under ~/.config), in display order
+    let table: [(&str, &[&str], &str, PathBuf, &str); 8] = [
+        ("chrome", &["Google Chrome"], "Google/Chrome", local.join("Google/Chrome/User Data"), "google-chrome"),
+        ("firefox", &["Firefox", "Firefox Developer Edition", "Firefox Nightly"], "Firefox/Profiles", roaming.join("Mozilla/Firefox/Profiles"), ""),
+        ("edge", &["Microsoft Edge"], "Microsoft Edge", local.join("Microsoft/Edge/User Data"), "microsoft-edge"),
+        ("brave", &["Brave Browser"], "BraveSoftware/Brave-Browser", local.join("BraveSoftware/Brave-Browser/User Data"), "BraveSoftware/Brave-Browser"),
+        ("opera", &["Opera"], "com.operasoftware.Opera", roaming.join("Opera Software/Opera Stable"), "opera"),
+        ("vivaldi", &["Vivaldi"], "Vivaldi", local.join("Vivaldi/User Data"), "vivaldi"),
+        ("chromium", &["Chromium"], "Chromium", local.join("Chromium/User Data"), "chromium"),
+        ("whale", &["Whale", "Naver Whale"], "Naver/Whale", local.join("Naver/Naver Whale/User Data"), "naver-whale"),
+    ];
+    let mut ids: Vec<&str> = table
+        .into_iter()
+        .filter(|(id, apps, mac_dir, win_dir, linux_dir)| {
+            let dirs = if mac {
+                vec![config.join(mac_dir)]
+            } else if cfg!(windows) {
+                vec![win_dir.clone()]
+            } else if *id == "firefox" {
+                // regular, Snap and Flatpak installs
+                ["", "snap/firefox/common/", ".var/app/org.mozilla.firefox/"].iter().map(|pre| home.join(format!("{pre}.mozilla/firefox"))).collect()
+            } else {
+                vec![config.join(linux_dir)]
+            };
+            let app_found = !mac || apps.iter().any(|a| [PathBuf::from("/Applications"), home.join("Applications")].iter().any(|d| d.join(format!("{a}.app")).exists()));
+            app_found && dirs.iter().any(|d| d.is_dir())
+        })
+        .map(|(id, ..)| id)
+        .collect();
+    // every Mac has Safari, and its cookie folder stays hidden from the app until it has Full Disk Access
+    if mac {
+        ids.insert(ids.len().min(1), "safari");
+    }
+    ids
 }
 
 #[tauri::command]
@@ -629,6 +673,7 @@ pub fn run() {
             install_tools,
             list_sites,
             import_cookies,
+            browsers,
             cookie_sites,
             remove_cookies,
             test_proxy,

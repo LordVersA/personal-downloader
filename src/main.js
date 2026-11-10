@@ -343,6 +343,7 @@ async function fetchLink(url, tab) {
     if (id === probeId && !got) throw "There's nothing to download at this link.";
   } catch (err) {
     if (id !== probeId) return;
+    err = signedInAnyway(err);
     errorEl.innerHTML = errHtml(err);
     errorEl.hidden = false;
     if (needsCookies(err)) askCookies(err, () => fetchLink(url, tab));
@@ -484,6 +485,7 @@ async function pump() {
 const errHtml = (e) => String(e).split("\n").map((l, i) => i ? `<small>${esc(l)}</small>` : esc(l)).join("");
 
 function fail(it, error) {
+  error = signedInAnyway(error);
   Object.assign(it, { status: "failed", error });
   finished++;
   // retry every download that failed for want of a sign-in
@@ -680,57 +682,79 @@ $("#clear").addEventListener("click", () => { history = []; saveHistory(); });
 /* Settings */
 
 // Browser cookies: one snapshot of the signed-in browser, used for every fetch and download
+const BROWSERS = { chrome: "Chrome", safari: "Safari", firefox: "Firefox", edge: "Edge", brave: "Brave", opera: "Opera", vivaldi: "Vivaldi", chromium: "Chromium", whale: "Whale" };
+// only the browsers on this computer; if none turn up where yt-dlp looks, offer them all rather than nothing
+let installed = await invoke("browsers").catch(() => []);
+if (!installed.length) installed = Object.keys(BROWSERS);
+let browser = installed.includes(store("cookieBrowser")) ? store("cookieBrowser") : installed[0];
 const cookieStatus = $("#cookie-status");
-const cookieBrowser = $("#cookie-browser");
-cookieBrowser.value = store("cookieBrowser") ?? "chrome";
-cookieBrowser.addEventListener("change", () => store("cookieBrowser", cookieBrowser.value));
-const showCookies = async (on, note) => {
+const importBtn = $("#cookie-import");
+// real radios, so arrow keys and screen readers work as usual
+const browserPicker = (el, name) => {
+  el.innerHTML = installed.map((id) => `<label class="browser"><input type="radio" name="${name}" value="${id}"><span><img src="browsers/${id}.svg" alt="" width="16" height="16">${BROWSERS[id]}</span></label>`).join("");
+  el.addEventListener("change", (e) => pickBrowser(e.target.value));
+};
+// keeps the Settings and dialog pickers in step
+function pickBrowser(id) {
+  browser = store("cookieBrowser", id);
+  for (const r of document.querySelectorAll(`.browsers input[value="${id}"]`)) r.checked = true;
+  importBtn.textContent = `Import from ${BROWSERS[id]}`;
+}
+browserPicker($("#cookie-browser"), "browser");
+browserPicker($("#ask-browser"), "ask-browser");
+pickBrowser(browser);
+
+const showCookies = async (on) => {
   $("#cookie-remove").hidden = !on;
-  cookieStatus.textContent = note ?? (on ? "Imported; re-import when sign-in expires" : "Sign-in for YouTube, Instagram, X and other sites");
-  $("#cookie-sites").replaceChildren();
+  $("#cookie-sites-box").hidden = true;
+  cookieStatus.textContent = on ? store("cookieNote") || "Imported; import again when sign-in expires" : "Import your browser's cookies to download from YouTube, Instagram, X and more as you, signed in";
   if (!on) return;
-  // the signed-in sites yt-dlp can download from
+  // the sites in the cookies that yt-dlp can download from
   const sites = await invoke("cookie_sites").catch(() => []);
   $("#cookie-sites").replaceChildren(...sites.map((s) => Object.assign(document.createElement("i"), { className: "tag", textContent: s })));
+  $("#cookie-sites-sum").textContent = `Cookies for ${sites.length} supported site${sites.length === 1 ? "" : "s"}`;
+  $("#cookie-sites-box").hidden = !sites.length;
 };
 // true when it worked; the outcome lands in the Settings row and in `out`
-async function importCookies(browser, out) {
+async function importCookies(out) {
   out.textContent = cookieStatus.textContent = "Reading cookies; allow access if your system asks…";
   try {
-    const note = `Imported ${await invoke("import_cookies", { browser })}`;
-    out.textContent = note;
-    showCookies(true, note);
+    const n = await invoke("import_cookies", { browser });
+    importedAt = Date.now();
+    out.textContent = store("cookieNote", `${n.toLocaleString("en")} cookies from ${BROWSERS[browser]} · imported ${new Date().toLocaleDateString("en", { month: "short", day: "numeric" })}`);
+    showCookies(true);
     return true;
   } catch (e) {
     out.innerHTML = cookieStatus.innerHTML = errHtml(e);
     return false;
   }
 }
-$("#cookie-import").addEventListener("click", () => busy($("#cookie-import"), "Importing…", () => importCookies(cookieBrowser.value, cookieStatus)));
+importBtn.addEventListener("click", () => busy(importBtn, "Importing…", () => importCookies(cookieStatus)));
 
 // A fetch or download failed in a way signing in fixes: offer to import cookies, then retry
 const ask = $("#cookie-ask");
 let askRetry;
 // shortcut: spotted by the backend's explanation pointing at Settings → Browser cookies; tag errors with a kind if that wording changes
 const needsCookies = (e) => String(e).includes("Browser cookies");
+let importedAt = 0;
+// refused right after a fresh import: importing again won't help (often a yt-dlp bug), so say so instead of asking again
+const signedInAnyway = (e) => needsCookies(e) && Date.now() - importedAt < 10 * 60e3
+  ? ["Your cookies were just imported, but the site still refused. yt-dlp may not support this page right now; update yt-dlp in Settings or try again later.", ...String(e).split("\n").slice(1)].join("\n")
+  : e;
 function askCookies(error, retry) {
   if (ask.open) return;
   askRetry = retry;
   $("#ask-why").textContent = String(error).split("\n")[0];
   $("#ask-status").textContent = "";
-  $("#ask-browser").replaceChildren(...[...cookieBrowser.options].map((o) => o.cloneNode(true)));
-  $("#ask-browser").value = cookieBrowser.value;
   ask.showModal();
 }
 $("#ask-cancel").addEventListener("click", () => ask.close());
 $("#ask-import").addEventListener("click", () => busy($("#ask-import"), "Importing…", async () => {
-  cookieBrowser.value = $("#ask-browser").value;
-  store("cookieBrowser", cookieBrowser.value);
-  if (!(await importCookies(cookieBrowser.value, $("#ask-status")))) return;
+  if (!(await importCookies($("#ask-status")))) return;
   ask.close();
   askRetry?.();
 }));
-$("#cookie-remove").addEventListener("click", () => invoke("remove_cookies").then(() => showCookies(false), (e) => (cookieStatus.textContent = String(e))));
+$("#cookie-remove").addEventListener("click", () => invoke("remove_cookies").then(() => showCookies(false, store("cookieNote", "")), (e) => (cookieStatus.textContent = String(e))));
 
 const home = await window.__TAURI__.path.homeDir().catch(() => "");
 const showDir = () => {
