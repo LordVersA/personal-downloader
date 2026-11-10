@@ -266,9 +266,21 @@ fn browsers(app: AppHandle) -> Vec<&'static str> {
     // (id, macOS apps, profile folder: macOS under Application Support, Windows, Linux under ~/.config), in display order
     let table: [(&str, &[&str], &str, PathBuf, &str); 8] = [
         ("chrome", &["Google Chrome"], "Google/Chrome", local.join("Google/Chrome/User Data"), "google-chrome"),
-        ("firefox", &["Firefox", "Firefox Developer Edition", "Firefox Nightly"], "Firefox/Profiles", roaming.join("Mozilla/Firefox/Profiles"), ""),
+        (
+            "firefox",
+            &["Firefox", "Firefox Developer Edition", "Firefox Nightly"],
+            "Firefox/Profiles",
+            roaming.join("Mozilla/Firefox/Profiles"),
+            "",
+        ),
         ("edge", &["Microsoft Edge"], "Microsoft Edge", local.join("Microsoft/Edge/User Data"), "microsoft-edge"),
-        ("brave", &["Brave Browser"], "BraveSoftware/Brave-Browser", local.join("BraveSoftware/Brave-Browser/User Data"), "BraveSoftware/Brave-Browser"),
+        (
+            "brave",
+            &["Brave Browser"],
+            "BraveSoftware/Brave-Browser",
+            local.join("BraveSoftware/Brave-Browser/User Data"),
+            "BraveSoftware/Brave-Browser",
+        ),
         ("opera", &["Opera"], "com.operasoftware.Opera", roaming.join("Opera Software/Opera Stable"), "opera"),
         ("vivaldi", &["Vivaldi"], "Vivaldi", local.join("Vivaldi/User Data"), "vivaldi"),
         ("chromium", &["Chromium"], "Chromium", local.join("Chromium/User Data"), "chromium"),
@@ -283,11 +295,17 @@ fn browsers(app: AppHandle) -> Vec<&'static str> {
                 vec![win_dir.clone()]
             } else if *id == "firefox" {
                 // regular, Snap and Flatpak installs
-                ["", "snap/firefox/common/", ".var/app/org.mozilla.firefox/"].iter().map(|pre| home.join(format!("{pre}.mozilla/firefox"))).collect()
+                ["", "snap/firefox/common/", ".var/app/org.mozilla.firefox/"]
+                    .iter()
+                    .map(|pre| home.join(format!("{pre}.mozilla/firefox")))
+                    .collect()
             } else {
                 vec![config.join(linux_dir)]
             };
-            let app_found = !mac || apps.iter().any(|a| [PathBuf::from("/Applications"), home.join("Applications")].iter().any(|d| d.join(format!("{a}.app")).exists()));
+            let app_found = !mac
+                || apps.iter().any(|a| {
+                    [PathBuf::from("/Applications"), home.join("Applications")].iter().any(|d| d.join(format!("{a}.app")).exists())
+                });
             app_found && dirs.iter().any(|d| d.is_dir())
         })
         .map(|(id, ..)| id)
