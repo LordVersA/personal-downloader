@@ -98,6 +98,7 @@ document.addEventListener("keydown", (e) => {
 let info, infoUrl, choices = [];
 let opts = { container: "mp4", afmt: "mp3", ...(load("opts") ?? { metadata: true, embed: true, thumbnail: false, sponsors: false, subs: [], auto: "" }) };
 const compact = (n) => new Intl.NumberFormat(undefined, { notation: "compact" }).format(n);
+const unit = () => (info?.music || pl?.music ? "song" : "video");
 const plural = (n, w) => `${compact(n)} ${w}${n === 1 ? "" : "s"}`; // chapters, subtitles
 
 // A playlist's videos each have their own formats, so it gets height caps that fit any video
@@ -105,14 +106,15 @@ const HEIGHTS = [2160, 1440, 1080, 720, 480];
 const LANGS = { en: "English", fa: "Farsi", ar: "Arabic", es: "Spanish", fr: "French", de: "German", ru: "Russian", tr: "Turkish", pt: "Portuguese", it: "Italian", hi: "Hindi", ja: "Japanese", ko: "Korean", zh: "Chinese" };
 
 function buildChoices() {
-  if (info._type === "playlist") {
+  // Spotify songs: audio only, chosen before yt-dlp has seen the video
+  if (info._type === "playlist" || info.music) {
     choices = [
       { group: "Video", q: "Best", d: ["", "Highest available"], format: "bv*+ba/b", size: 0 },
       ...HEIGHTS.map((h) => ({ group: "Video", q: `${h}p`, d: ["", "or the best below"], format: `bv*[height<=${h}]+ba/b[height<=${h}]`, size: 0 })),
       { group: "Audio", q: "Convert", d: ["", "Best audio, re-encoded"], format: "ba/b", convert: true, audio: true, size: 0 },
       // m4a first: it takes a cover; webm audio can't
       { group: "Audio", q: "Original", d: ["", "Best audio as served"], format: "ba[ext=m4a]/ba/b", audio: true, ext: "m4a", size: 0 },
-    ];
+    ].filter((c) => c.audio || !info.music);
     return;
   }
   const d = info.duration;
@@ -166,7 +168,7 @@ function renderPick() {
   const toggle = (name, label) => `<label class="toggle"><input type="checkbox" name="${name}" ${opts[name] ? "checked" : ""} /><span>${label}</span></label>`;
   const select = (name, vals) => `<select name="${name}">${vals.map((v) => `<option value="${v}" ${opts[name] === v ? "selected" : ""}>${v.toUpperCase()}</option>`).join("")}</select>`;
   const all = choices.filter((c) => c.group === "All").length;
-  const count = info._type === "playlist" && plural(info.entries.length, "video");
+  const count = info._type === "playlist" && plural(info.entries.length, unit());
   pick.innerHTML = `
     <header class="pick-head">${btn("close", "Close", ICON.stop)}</header>
     <div class="choices">
@@ -204,7 +206,7 @@ function renderPick() {
     </footer>`;
   pick.firstElementChild.prepend(row("div", "item", info.thumbnail ?? info.thumbnails?.at(-1)?.url, info.title ?? infoUrl,
     [esc(info.uploader ?? info.channel ?? info.extractor_key ?? ""), info.duration && dur(info.duration), count]));
-  if (!list) pick.firstElementChild.after(about());
+  if (!list && !info.music) pick.firstElementChild.after(about());
   pick.hidden = false;
   updatePick();
   renderHistory();
@@ -245,7 +247,7 @@ function readPick() {
 
 function updatePick() {
   const { c, subs, autoLang, has } = readPick();
-  $("#go").textContent = `Download ${info._type === "playlist" ? `${plural(info.entries.length, "video")} · ` : ""}${c?.audio ? (c.convert ? pick.afmt.value : c.ext ?? "") .toUpperCase() : pick.container.value.toUpperCase()}${c?.size ? ` · ${mb(c.size)}` : ""}`.replace("  ", " ");
+  $("#go").textContent = `Download ${info._type === "playlist" ? `${plural(info.entries.length, unit())} · ` : ""}${c?.audio ? (c.convert ? pick.afmt.value : c.ext ?? "") .toUpperCase() : pick.container.value.toUpperCase()}${c?.size ? ` · ${mb(c.size)}` : ""}`.replace("  ", " ");
   const langs = [...subs, autoLang].filter(Boolean);
   $("#opts-sum").textContent = [langs.length && `Subtitles (${langs.join(", ")})`, has("metadata") && "Metadata", has("thumbnail") && "Thumbnail", has("sponsors") && "Sponsors cut"]
     .filter(Boolean).join(" · ") || "None";
@@ -348,6 +350,7 @@ form.addEventListener("submit", async (e) => {
   if (use === "aria2c") return isTorrent(url) ? torrentPick(url) : filePick(url);
   if (use === "gallery-dl") return galleryPick(url, !!$("#use").value);
   if (use === "streamlink") return livePick(url, !!$("#use").value);
+  if (use === "spotify") return spotifyPick(url);
   // a YouTube channel lists one tab at a time
   const base = url.match(CHANNEL)?.[1];
   fetchLink(base ? `${base}/videos` : url, base && { base, tab: "videos" });
@@ -462,6 +465,47 @@ async function galleryPick(url, forced) {
   pick.file = { url, title: name, count: n };
   pick.hidden = false;
   renderHistory();
+}
+
+// A Spotify link: its tracks from Spotify's embed page, each fetched as YouTube Music's first song result. An album,
+// playlist or artist opens the song list; a single track goes straight to the audio choices
+// shortcut: no check that the YouTube Music match is the same song (duration, artist); compare durations if users hit misses
+async function spotifyPick(url) {
+  if (probeId) invoke("cancel", { id: probeId });
+  closePick();
+  const id = (probeId = nextId++);
+  fetchBtn.classList.add("busy");
+  fetchBtn.textContent = "Fetching…";
+  logEl.textContent = "Reading the Spotify link…";
+  logEl.hidden = false;
+  let s;
+  try {
+    s = await invoke("spotify_tracks", { url, proxy: proxy() });
+    if (id !== probeId) return;
+  } catch (err) {
+    if (id !== probeId) return;
+    errorEl.innerHTML = errHtml(err);
+    errorEl.hidden = false;
+  } finally {
+    if (id === probeId) {
+      probeId = 0;
+      logEl.hidden = true;
+      fetchBtn.classList.remove("busy");
+      fetchBtn.textContent = "Fetch";
+    }
+  }
+  if (!s) return;
+  const songs = s.tracks.map((t, i) => ({ music: true, title: `${t.artists} - ${t.title}`, duration: t.duration, playlist_index: i + 1, playlist_title: s.title,
+    url: `https://music.youtube.com/search?q=${encodeURIComponent(`${t.artists} ${t.title}`)}#songs` }));
+  if (s.kind === "track") {
+    infoUrl = songs[0].url;
+    info = { ...songs[0], uploader: "Spotify", thumbnail: s.thumb };
+    return renderPick();
+  }
+  openList({ music: true });
+  songs.forEach(addEntry);
+  pl.loading = false;
+  listCount();
 }
 
 // A live channel: pick a quality, optionally a time limit, then Record. An offline channel or a link streamlink can't
@@ -618,10 +662,10 @@ const checked = () => [...pick.querySelectorAll(".entries input:checked")].map((
 
 function listCount() {
   const n = pick.querySelectorAll(".entries input:checked").length, all = pl.entries.length;
-  pick.querySelector(".list-status").textContent = pl.loading ? `Loading… ${plural(all, "video")}` : plural(all, "video");
+  pick.querySelector(".list-status").textContent = pl.loading ? `Loading… ${plural(all, unit())}` : plural(all, unit());
   pick.querySelector("[data-act=stop-list]").hidden = !pl.loading;
   const next = pick.querySelector("[data-act=next]");
-  next.textContent = n ? `Choose quality · ${plural(n, "video")}` : "Select videos";
+  next.textContent = n ? `Choose quality · ${plural(n, unit())}` : `Select ${unit()}s`;
   next.disabled = !n;
 }
 
@@ -642,7 +686,7 @@ pick.addEventListener("click", (e) => {
   if (act === "next") {
     const sel = checked();
     if (pl.loading) invoke("cancel", { id: probeId });
-    info = { _type: "playlist", title: pl.title || infoUrl, entries: sel, thumbnail: thumbOf(sel[0]), uploader: sel[0].playlist_uploader ?? sel[0].channel, extractor_key: sel[0].ie_key ?? sel[0].extractor_key };
+    info = { _type: "playlist", music: pl.music, title: pl.title || infoUrl, entries: sel, thumbnail: thumbOf(sel[0]), uploader: sel[0].playlist_uploader ?? sel[0].channel, extractor_key: sel[0].ie_key ?? sel[0].extractor_key };
     renderPick();
   }
 });

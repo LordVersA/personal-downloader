@@ -34,7 +34,7 @@ Also decided (follows from existing code, no question needed):
 | Match | Tool | Fallback |
 |---|---|---|
 | `magnet:` or `*.torrent` | aria2c (torrent) | none |
-| `open.spotify.com/{track,album,playlist,artist}` | spotDL | none |
+| `open.spotify.com/{track,album,playlist,artist}` | Spotify embed → yt-dlp (YouTube Music) | none |
 | `*.m3u8`, `*.mpd` | N_m3u8DL-RE | yt-dlp |
 | `twitch.tv/<channel>`, `kick.com/<channel>`, `youtube.com/.../live` | streamlink | yt-dlp |
 | instagram, pixiv, deviantart, imgur, reddit gallery, tumblr, x.com `/photo/` | gallery-dl | yt-dlp |
@@ -48,7 +48,7 @@ Each phase ships as its own release.
 2. **Torrents**: aria2c RPC, file picker, peers/seeds, metadata stage.
 3. **Images**: uv and gallery-dl.
 4. **Live**: streamlink.
-5. **Spotify**: spotDL.
+5. **Spotify**: track list from Spotify's embed page, audio through yt-dlp (spotDL dropped, see Phase 5).
 6. **HLS/DASH**: N_m3u8DL-RE.
 
 ## Tasks
@@ -85,10 +85,10 @@ Each phase ships as its own release.
 - [x] Live jobs run outside the one-at-a-time queue. *They don't show in the Download-page strip or the tab badge; the Library row shows `LIVE ● 00:12:34 · 340 MB`.*
 - [x] ffmpeg remux `.ts` → `.mp4` when done. *`-n` never overwrites; if the remux fails, the `.ts` is kept with a warning. File name: `<channel> YYYY-MM-DD HH-MM-SS`.*
 
-### Phase 5: Spotify (spotDL)
-- [ ] `uv tool install spotdl` (uses the app's ffmpeg via `--ffmpeg`).
-- [ ] Preview: `spotdl save <url> --save-file -` → track list.
-- [ ] Download: `--format` / `--bitrate` from the Audio setting; playlist subfolder; progress = tracks done / total.
+### Phase 5: Spotify (no spotDL)
+*spotDL 4.6.0 was tried and dropped: its shared Spotify API key answers 429 with `Retry-After: 86400` (checked 2026-11-11), so every link hangs, and a key of one's own needs a Spotify developer app. spotDL only finds each song on YouTube anyway, which the app's yt-dlp already does.*
+- [x] Preview: `spotify_tracks` reads the public embed page (`open.spotify.com/embed/<kind>/<id>`, no key) through the app's proxy → title, cover and tracks (artists, title, duration). *An album, playlist or artist opens the song list (playlist select UI); a single track goes straight to the choices. The embed lists at most 100 tracks of a playlist, and an artist's top 10.*
+- [x] Download: each song is a normal yt-dlp queue item for `music.youtube.com/search?q=<artists title>#songs` with `-I 1` (the first song result, an official audio track with artist/album tags, not the music video). Only the Audio choices show (Convert, using the remembered Audio format, mp3 by default; or Original). Lists go into a subfolder named after the album or playlist, like yt-dlp playlists. *The match isn't checked against the Spotify duration.*
 
 ### Phase 6: HLS/DASH (N_m3u8DL-RE)
 - [ ] Fetch the release binary per OS.
@@ -98,7 +98,7 @@ Each phase ships as its own release.
 
 ## Risks & guardrails
 - **DRM:** no decryption, by any tool, ever (legal reasons: DMCA §1201 / EU InfoSoc Art. 6).
-- **spotDL** is legally gray (it doesn't break DRM, but it's mostly used for commercial music). Keep it behind Spotify-URL routing and don't mention it in marketing.
+- **Spotify links** are legally gray (nothing is taken from Spotify but the track names; the audio is YouTube's, but it's mostly commercial music). Keep it behind Spotify-URL routing and don't mention it in marketing.
 - **Torrents:** the user's IP is visible to peers while downloading. Mention this once in Settings.
 - **uv + Python** adds roughly 40–60 MB the first time a Python tool is used.
 - **The rules table will miss sites.** The override dropdown and the yt-dlp fallback cover it; add rules as users hit misses.

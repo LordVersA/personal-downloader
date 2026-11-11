@@ -143,7 +143,7 @@ fn fetch_aria2(dir: &std::path::Path) -> Result<(), String> {
     unzip(dir, fetch(&format!("{base}/{file}"), |_| format!("{base}/SHA2-256SUMS"), file)?, &[exe("aria2c")])
 }
 
-// uv installs and runs the Python tools (gallery-dl, later streamlink and spotDL) with a Python of its own
+// uv installs and runs the Python tools (gallery-dl, streamlink) with a Python of its own
 fn fetch_uv(dir: &std::path::Path) -> Result<(), String> {
     let target = if cfg!(windows) {
         "x86_64-pc-windows-msvc.zip"
@@ -764,13 +764,61 @@ fn torrent_list(s: &str) -> (String, Vec<Value>) {
     (name, files)
 }
 
+// A Spotify link's name, cover and tracks, read from its public embed page: no API key needed (spotDL's shared key gets
+// rate-limited for a day at a time). The UI downloads each track from YouTube Music with yt-dlp.
+// shortcut: the embed lists at most 100 tracks of a playlist and an artist's top 10; use the Web API with the user's own key if that's too few
+#[tauri::command]
+async fn spotify_tracks(url: String, proxy: String) -> Result<Value, String> {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let segs: Vec<&str> = path.split('/').collect();
+    let at = segs
+        .iter()
+        .position(|s| ["track", "album", "playlist", "artist"].contains(s))
+        .ok_or("Not a Spotify track, album, playlist or artist link")?;
+    let id = segs.get(at + 1).filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())).ok_or("Not a Spotify link")?;
+    let p = if proxy.is_empty() { None } else { Some(ureq::Proxy::new(&proxy).map_err(|e| format!("Bad proxy: {e}"))?) };
+    let agent: ureq::Agent = ureq::Agent::config_builder().proxy(p).timeout_global(Some(Duration::from_secs(20))).build().into();
+    let html = agent
+        .get(&format!("https://open.spotify.com/embed/{}/{id}", segs[at]))
+        .header("User-Agent", "Mozilla/5.0")
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string())
+        .map_err(|e| format!("Couldn't reach Spotify\n{e}"))?;
+    spotify_list(&html).ok_or_else(|| "Spotify didn't list any tracks for this link".into())
+}
+
+// {title, thumb, tracks: [{title, artists, duration (s)}]} from the page's __NEXT_DATA__ JSON
+fn spotify_list(html: &str) -> Option<Value> {
+    let start = html.find(r#"<script id="__NEXT_DATA__" type="application/json">"#)?;
+    let json = &html[start..];
+    let json = &json[json.find('>')? + 1..json.find("</script>")?];
+    let v: Value = serde_json::from_str(json).ok()?;
+    let e = &v["props"]["pageProps"]["state"]["data"]["entity"];
+    let track =
+        |title: &Value, artists: String, ms: &Value| json!({"title": title, "artists": artists, "duration": ms.as_u64().map(|m| m / 1000)});
+    let tracks: Vec<Value> = match e["trackList"].as_array() {
+        // a list's subtitle is "Artist,\u{a0}Other"
+        Some(list) => list
+            .iter()
+            .map(|t| track(&t["title"], t["subtitle"].as_str().unwrap_or_default().replace('\u{a0}', " "), &t["duration"]))
+            .collect(),
+        None => {
+            let names: Vec<&str> = e["artists"].as_array()?.iter().filter_map(|a| a["name"].as_str()).collect();
+            vec![track(&e["name"], names.join(", "), &e["duration"])]
+        }
+    };
+    let thumb =
+        e["visualIdentity"]["image"].as_array().and_then(|i| i.iter().max_by_key(|i| i["maxWidth"].as_u64())).map(|i| i["url"].clone());
+    (!tracks.is_empty()).then(|| json!({"title": e["name"], "kind": e["type"], "thumb": thumb, "tracks": tracks}))
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Tool {
     YtDlp,
     Aria2,
     GalleryDl,
     Streamlink,
-    SpotDl,
+    Spotify,
     Nm3u8,
 }
 
@@ -798,7 +846,7 @@ fn pick_tool(url: &str) -> Tool {
     if ext == "torrent" {
         Tool::Aria2
     } else if site("open.spotify.com") && segs.iter().any(|s| ["track", "album", "playlist", "artist"].contains(s)) {
-        Tool::SpotDl
+        Tool::Spotify
     } else if ext == "m3u8" || ext == "mpd" {
         Tool::Nm3u8
     } else if (site("twitch.tv") || site("kick.com")) && segs.len() == 1 || site("youtube.com") && segs.last() == Some(&"live") {
@@ -816,13 +864,14 @@ fn pick_tool(url: &str) -> Tool {
 }
 
 // The tool the UI should use for this link.
-// shortcut: spotDL and N_m3u8DL-RE arrive in later phases; until then their links go to yt-dlp
+// shortcut: N_m3u8DL-RE arrives in a later phase; until then its links go to yt-dlp
 #[tauri::command]
 fn route(url: String) -> &'static str {
     match pick_tool(&url) {
         Tool::Aria2 => "aria2c",
         Tool::GalleryDl => "gallery-dl",
         Tool::Streamlink => "streamlink",
+        Tool::Spotify => "spotify",
         _ => "yt-dlp",
     }
 }
@@ -1139,6 +1188,10 @@ fn ytdlp_download(app: &AppHandle, url: &str, dir: &str, proxy: &str, opts: &Opt
     if opts.sponsors {
         cmd.args(["--sponsorblock-remove", "sponsor"]);
     }
+    // a Spotify track is fetched as YouTube Music's first song result
+    if url.starts_with("https://music.youtube.com/search?") {
+        cmd.args(["-I", "1"]);
+    }
     cmd.arg("--").arg(url);
     Ok(cmd)
 }
@@ -1316,6 +1369,7 @@ pub fn run() {
             probe,
             torrent_files,
             gallery_files,
+            spotify_tracks,
             live_streams,
             remove_tool,
             download,
@@ -1383,8 +1437,8 @@ mod tests {
         for (url, want) in [
             ("magnet:?xt=urn:btih:abc&dn=Ubuntu", Aria2),
             ("https://releases.ubuntu.com/x/ubuntu.iso.torrent?x=1", Aria2),
-            ("https://open.spotify.com/intl-de/track/abc", SpotDl),
-            ("https://open.spotify.com/playlist/abc?si=1", SpotDl),
+            ("https://open.spotify.com/intl-de/track/abc", Spotify),
+            ("https://open.spotify.com/playlist/abc?si=1", Spotify),
             ("https://cdn.example.com/live/master.m3u8?token=1", Nm3u8),
             ("https://example.com/stream.MPD", Nm3u8),
             ("https://www.twitch.tv/somechannel", Streamlink),
@@ -1403,6 +1457,35 @@ mod tests {
         ] {
             assert_eq!(pick_tool(url), want, "{url}");
         }
+    }
+
+    #[test]
+    fn reads_spotify_embed() {
+        let page = |e: &str| {
+            format!(
+                r#"<html><script id="__NEXT_DATA__" type="application/json">{{"props":{{"pageProps":{{"state":{{"data":{{"entity":{e}}}}}}}}}}}</script></html>"#
+            )
+        };
+        let album = page(
+            r#"{"type":"album","name":"A","visualIdentity":{"image":[{"url":"s","maxWidth":64},{"url":"b","maxWidth":640}]},
+            "trackList":[{"title":"Song (feat. Y)","subtitle":"X,\u00a0Y","duration":85400}]}"#,
+        );
+        let v = spotify_list(&album).unwrap();
+        assert_eq!(v["thumb"], "b");
+        assert_eq!(v["tracks"][0], json!({"title": "Song (feat. Y)", "artists": "X, Y", "duration": 85}));
+        let track = page(r#"{"type":"track","name":"T","duration":213573,"artists":[{"name":"R"},{"name":"S"}]}"#);
+        assert_eq!(spotify_list(&track).unwrap()["tracks"][0], json!({"title": "T", "artists": "R, S", "duration": 213}));
+        assert!(spotify_list("<html>404</html>").is_none());
+    }
+
+    // network; PD_PROXY=http://127.0.0.1:10808 where Spotify is blocked
+    #[test]
+    #[ignore]
+    fn reads_live_spotify() {
+        let url = "https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy?si=x".to_string();
+        let v = tauri::async_runtime::block_on(spotify_tracks(url, std::env::var("PD_PROXY").unwrap_or_default())).unwrap();
+        assert_eq!(v["kind"], "album");
+        assert_eq!(v["tracks"].as_array().unwrap().len(), 18);
     }
 
     #[test]
