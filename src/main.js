@@ -1,3 +1,6 @@
+import { supportedSources } from "./supported-sources.js";
+import { toolVersion } from "./tool-version.js";
+
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { opener, notification } = window.__TAURI__;
@@ -7,7 +10,6 @@ const finder = isMac ? "Show in Finder" : "Show in folder";
 const ICON = {
   stop: '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>',
   pause: '<svg viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></svg>',
-  play: '<svg viewBox="0 0 24 24"><path d="M7 4.5v15L19 12z"/></svg>',
   retry: '<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5"/></svg>',
   check: '<svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>',
   down: '<svg viewBox="0 0 24 24"><path d="M12 4v12m-5-5 5 5 5-5M5 20h14"/></svg>',
@@ -26,6 +28,7 @@ const store = (k, v) => { try { v === undefined ? (v = localStorage[k]) : (local
 const load = (k) => { try { return JSON.parse(store(k)); } catch {} };
 
 let nextId = 1;
+let toolsBusy = true;
 const items = []; // this session's queue: queued, active or failed; done ones move to history
 let batch = 0, finished = 0; // "n of m" since the queue last emptied
 let saved = null; // last finished download, shown in the strip for a few seconds
@@ -55,25 +58,54 @@ function when(t) {
   return d.toLocaleDateString("en", { month: "short", day: "numeric", ...(d.getFullYear() !== new Date().getFullYear() && { year: "numeric" }) });
 }
 
-// One row shape for queue, history and recent. meta entries are trusted HTML; escape before passing.
+// Shared rows for queue and media previews. meta entries are trusted HTML; escape before passing.
 const metaHtml = (meta) => meta.filter(Boolean).map((m) => `<span class="nums" dir="auto">${m}</span>`).join("");
+const thumbnails = new Map();
+async function loadThumbnail(el, url) {
+  const key = `${proxy()}|${url}`;
+  if (!thumbnails.has(key)) {
+    const request = invoke("thumbnail", { url, proxy: proxy() }).then(({ mime, bytes }) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(new Blob([new Uint8Array(bytes)], { type: mime }));
+    })).catch(() => { thumbnails.delete(key); return null; });
+    thumbnails.set(key, request);
+    // shortcut: cache 80 previews in memory; use a disk cache if offline previews become necessary.
+    if (thumbnails.size > 80) thumbnails.delete(thumbnails.keys().next().value);
+  }
+  const data = await thumbnails.get(key);
+  if (data) {
+    const img = new Image();
+    img.alt = "";
+    img.onerror = () => { el.title = "Preview unavailable. You can still download this item."; };
+    img.onload = () => el.replaceChildren(img);
+    img.src = data;
+  } else el.title = "Preview unavailable. You can still download this item.";
+}
+const thumbObserver = new IntersectionObserver((entries) => {
+  for (const { target, isIntersecting } of entries) if (isIntersecting) {
+    thumbObserver.unobserve(target);
+    loadThumbnail(target, target.dataset.thumb);
+  }
+}, { rootMargin: "120px" });
 function row(tag, cls, thumb, title, meta, right = "", mid = "") {
   const e = document.createElement(tag);
   e.className = cls;
   e.innerHTML = `
-    <span class="thumb-img"></span>
+    <span class="thumb-img" aria-hidden="true">${ICON.down}</span>
     <span class="body">
       <span class="name" dir="auto" title="${esc(title)}">${esc(title)}</span>${mid}
       <span class="meta">${metaHtml(meta)}</span>
     </span>${right}`;
-  if (thumb) e.firstElementChild.style.backgroundImage = `url("${encodeURI(thumb)}")`;
+  if (thumb) { e.firstElementChild.dataset.thumb = thumb; thumbObserver.observe(e.firstElementChild); }
   return e;
 }
 const btn = (act, label, icon) => `<button class="icon" type="button" data-act="${act}" aria-label="${label}" title="${label}">${icon}</button>`;
 
 /* Pages */
 
-const tabs = [...document.querySelectorAll("[role=tab]")];
+const tabs = [...document.querySelectorAll(".toolbar [role=tab]")];
 function show(page) {
   for (const t of tabs) {
     const on = t.dataset.page === page;
@@ -83,7 +115,10 @@ function show(page) {
   scrollTo(0, 0);
 }
 tabs.forEach((t) => t.addEventListener("click", () => show(t.dataset.page)));
-$("#see-all").addEventListener("click", () => show("library"));
+document.querySelectorAll("[data-setting]").forEach((button) => button.addEventListener("click", () => {
+  document.querySelectorAll("[data-setting]").forEach((b) => b.setAttribute("aria-pressed", b === button));
+  document.querySelectorAll("[data-settings]").forEach((panel) => panel.hidden = panel.dataset.settings !== button.dataset.setting);
+}));
 
 // ⌘V / Ctrl+V outside a text field pastes into the link field
 document.addEventListener("keydown", (e) => {
@@ -171,6 +206,7 @@ function renderPick() {
   const count = info._type === "playlist" && plural(info.entries.length, unit());
   pick.innerHTML = `
     <header class="pick-head">${btn("close", "Close", ICON.stop)}</header>
+    <div class="picker-guide"><b>Choose your quality</b><span>Best keeps the highest available quality. Choose Audio to save music only.</span></div>
     <div class="choices">
       ${group("Video") ? `<fieldset><legend>Video</legend>${group("Video")}</fieldset>` : ""}
       <fieldset><legend>Audio</legend>${group("Audio")}</fieldset>
@@ -271,7 +307,7 @@ pick.addEventListener("submit", (e) => {
   if (pick.dataset.step === "list") return; // Enter in the list's search field
   if (pick.dataset.step === "file" || pick.dataset.step === "gallery") {
     const g = pick.dataset.step === "gallery";
-    enqueue({ ...pick.file, label: g ? "Images" : "File", tool: g ? "gallery-dl" : "aria2c", opts: null });
+    enqueue({ ...pick.file, label: g ? "Images" : "File", tool: g ? "gallery-dl" : pick.file.tool ?? "aria2c", opts: null });
     form.link.value = "";
     return closePick();
   }
@@ -297,7 +333,7 @@ pick.addEventListener("submit", (e) => {
   if (pick.sublang) opts.lang = pick.sublang.value;
   store("opts", JSON.stringify(opts));
   const it = {
-    label: c.audio ? (c.convert ? opts.afmt.toUpperCase() : "Audio") : `${c.q} · ${opts.container.toUpperCase()}`,
+    label: c.audio ? (c.convert ? opts.afmt.toUpperCase() : "Audio") : `${c.q === "Best" ? c.d.find((value) => /^\d+p$/.test(value)) ?? c.q : c.q} · ${opts.container.toUpperCase()}`,
     size: c.size,
     opts: {
       format: c.format,
@@ -328,9 +364,66 @@ pick.addEventListener("submit", (e) => {
 });
 
 const errorEl = $("#error");
+$("#open-torrent").addEventListener("click", async () => {
+  if (toolsBusy) { errorEl.textContent = "Tools are being prepared. Please try again when they’re ready."; errorEl.hidden = false; return; }
+  try {
+    const path = await window.__TAURI__.dialog.open({ multiple: false, filters: [{ name: "Torrent file", extensions: ["torrent"] }] });
+    if (path) { errorEl.hidden = true; resetProbeLog(); infoUrl = path; await torrentPick(path); }
+  } catch (error) { errorEl.innerHTML = errHtml(error); errorEl.hidden = false; }
+});
+$("#use").addEventListener("change", () => {
+  $("#engine-note").textContent = TOOLS[$("#use").value]?.[0] ?? "Chooses the right tool for your link.";
+});
 const logEl = $("#probe-log");
-// yt-dlp's current step while fetching, e.g. "[youtube] abc: Downloading webpage"
-listen("probe-log", (e) => (logEl.textContent = e.payload));
+const logLines = [], fullLog = $("#log-full");
+let logTotal = 0, logAnimation;
+function resetProbeLog() {
+  logLines.length = logTotal = 0;
+  fullLog.replaceChildren();
+  $("#log-lines").replaceChildren();
+  $("#log-latest").textContent = "";
+  $("#log-toggle").setAttribute("aria-expanded", "false");
+  $("#log-toggle").textContent = "Show all";
+  fullLog.hidden = true;
+  $("#log-preview").hidden = false;
+  logEl.hidden = true;
+}
+function appendProbeLog(message) {
+  const lines = String(message).split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) return;
+  const follow = fullLog.hidden || fullLog.scrollHeight - fullLog.scrollTop - fullLog.clientHeight < 24;
+  for (const line of lines) {
+    logLines.push(line);
+    logTotal++;
+    fullLog.append(document.createTextNode(`${line}\n`));
+    // shortcut: retain 2,000 lines per link to bound memory during long-running probes.
+    if (logLines.length > 2000) { logLines.shift(); fullLog.firstChild.remove(); }
+  }
+  const preview = $("#log-lines");
+  preview.replaceChildren(...logLines.slice(-5).map((line) => {
+    const p = document.createElement("p");
+    p.textContent = line;
+    p.dir = "auto";
+    return p;
+  }));
+  $("#log-count").textContent = `${logTotal > logLines.length ? `${logLines.length.toLocaleString("en")} latest of ` : ""}${logTotal.toLocaleString("en")} ${logTotal === 1 ? "line" : "lines"}`;
+  $("#log-latest").textContent = logLines.at(-1);
+  logEl.hidden = false;
+  if (follow) fullLog.scrollTop = fullLog.scrollHeight;
+  if (fullLog.hidden && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    logAnimation?.cancel();
+    logAnimation = preview.animate([{ transform: "translateY(22px)" }, { transform: "translateY(0)" }], { duration: 220, easing: "ease-out" });
+  }
+}
+$("#log-toggle").addEventListener("click", () => {
+  const expanded = fullLog.hidden;
+  fullLog.hidden = !expanded;
+  $("#log-preview").hidden = expanded;
+  $("#log-toggle").setAttribute("aria-expanded", expanded);
+  $("#log-toggle").textContent = expanded ? "Show less" : "Show all";
+  if (expanded) fullLog.scrollTop = fullLog.scrollHeight;
+});
+listen("probe-log", (e) => appendProbeLog(e.payload));
 const fetchBtn = $("#fetch");
 let probeId = 0; // the running fetch; a newer one makes older results stale
 let got = 0; // lines the running fetch has sent
@@ -338,15 +431,23 @@ form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const url = form.link.value.trim();
   errorEl.hidden = true;
+  if (toolsBusy) {
+    errorEl.textContent = "Tools are being prepared. Please try again when they’re ready.";
+    errorEl.hidden = false;
+    return;
+  }
   if (!url) {
     form.classList.remove("shake");
     void form.offsetWidth; // restart the animation
     form.classList.add("shake");
     return;
   }
+  try { aria2Options(); } catch (error) { errorEl.textContent = error; errorEl.hidden = false; return; }
+  resetProbeLog();
   infoUrl = url;
-  // direct files, torrents and galleries skip yt-dlp's probe; the Advanced "Use" menu overrides the router
+  // Direct files, torrents and galleries skip the video probe; the tool selector overrides routing.
   const use = $("#use").value || (await invoke("route", { url }));
+  if (use === "N_m3u8DL-RE") return filePick(url, use);
   if (use === "aria2c") return isTorrent(url) ? torrentPick(url) : filePick(url);
   if (use === "gallery-dl") return galleryPick(url, !!$("#use").value);
   if (use === "streamlink") return livePick(url, !!$("#use").value);
@@ -365,7 +466,7 @@ async function fetchLink(url, tab) {
   if (tab) openList(tab);
   fetchBtn.classList.add("busy");
   fetchBtn.textContent = "Fetching…";
-  logEl.textContent = "";
+  appendProbeLog("Reading the link…");
   logEl.hidden = false;
   try {
     await invoke("probe", { id, url, proxy: proxy() });
@@ -378,9 +479,8 @@ async function fetchLink(url, tab) {
     if (needsCookies(err)) askCookies(err, () => fetchLink(url, tab));
   } finally {
     if (id === probeId) {
-      logEl.hidden = true;
       fetchBtn.classList.remove("busy");
-      fetchBtn.textContent = "Fetch";
+      fetchBtn.textContent = "Find download";
       if (pl) pl.loading = false;
       if (pick.dataset.step === "list") listCount();
     }
@@ -401,7 +501,7 @@ listen("probe-entry", ({ payload: { id, entry } }) => {
 });
 
 // A direct file or torrent: its name (from the link) and a Download button
-function filePick(url) {
+function filePick(url, tool = "aria2c") {
   if (probeId) invoke("cancel", { id: probeId });
   probeId = 0;
   closePick();
@@ -417,20 +517,20 @@ function filePick(url) {
   pick.innerHTML = `<header class="pick-head">${btn("close", "Close", ICON.stop)}</header>
     <footer class="pick-foot"><span class="grow"></span><button class="key" type="submit">Download</button></footer>`;
   pick.firstElementChild.prepend(row("div", "item", null, name, ["File"]));
-  pick.file = { url, title: name };
+  pick.file = { url, title: name, tool };
   pick.hidden = false;
   renderHistory();
 }
 
 // An image gallery: count its files, then one Download button. A link gallery-dl can't read goes to yt-dlp unless
-// the user picked gallery-dl in Advanced
+// the user selected gallery-dl under Download with
 async function galleryPick(url, forced) {
   if (probeId) invoke("cancel", { id: probeId });
   closePick();
   const id = (probeId = nextId++);
   fetchBtn.classList.add("busy");
   fetchBtn.textContent = "Fetching…";
-  logEl.textContent = "Looking for images…";
+  appendProbeLog("Looking for images…");
   logEl.hidden = false;
   let n;
   try {
@@ -447,9 +547,8 @@ async function galleryPick(url, forced) {
   } finally {
     if (id === probeId) {
       probeId = 0;
-      logEl.hidden = true;
       fetchBtn.classList.remove("busy");
-      fetchBtn.textContent = "Fetch";
+      fetchBtn.textContent = "Find download";
     }
   }
   if (!n) return fetchLink(url);
@@ -476,7 +575,7 @@ async function spotifyPick(url) {
   const id = (probeId = nextId++);
   fetchBtn.classList.add("busy");
   fetchBtn.textContent = "Fetching…";
-  logEl.textContent = "Reading the Spotify link…";
+  appendProbeLog("Reading the Spotify link…");
   logEl.hidden = false;
   let s;
   try {
@@ -489,9 +588,8 @@ async function spotifyPick(url) {
   } finally {
     if (id === probeId) {
       probeId = 0;
-      logEl.hidden = true;
       fetchBtn.classList.remove("busy");
-      fetchBtn.textContent = "Fetch";
+      fetchBtn.textContent = "Find download";
     }
   }
   if (!s) return;
@@ -509,14 +607,14 @@ async function spotifyPick(url) {
 }
 
 // A live channel: pick a quality, optionally a time limit, then Record. An offline channel or a link streamlink can't
-// read goes to yt-dlp unless the user picked streamlink in Advanced
+// read goes to yt-dlp unless the user selected Streamlink under Download with
 async function livePick(url, forced) {
   if (probeId) invoke("cancel", { id: probeId });
   closePick();
   const id = (probeId = nextId++);
   fetchBtn.classList.add("busy");
   fetchBtn.textContent = "Fetching…";
-  logEl.textContent = "Looking for the live stream…";
+  appendProbeLog("Looking for the live stream…");
   logEl.hidden = false;
   let s;
   try {
@@ -532,9 +630,8 @@ async function livePick(url, forced) {
   } finally {
     if (id === probeId) {
       probeId = 0;
-      logEl.hidden = true;
       fetchBtn.classList.remove("busy");
-      fetchBtn.textContent = "Fetch";
+      fetchBtn.textContent = "Find download";
     }
   }
   if (!s?.qualities.length) return fetchLink(url);
@@ -563,10 +660,10 @@ async function torrentPick(url) {
   const id = (probeId = nextId++);
   fetchBtn.classList.add("busy");
   fetchBtn.textContent = "Fetching…";
-  logEl.textContent = url.startsWith("magnet:") ? "Fetching metadata from peers…" : "Fetching the torrent file…";
+  appendProbeLog(url.startsWith("magnet:") ? "Fetching metadata from peers…" : "Reading the torrent file…");
   logEl.hidden = false;
   try {
-    const t = await invoke("torrent_files", { id, url, proxy: proxy() });
+    const t = await invoke("torrent_files", { id, url, proxy: proxy(), aria2Options: aria2Options() });
     if (id !== probeId || !t) return;
     pick.dataset.step = "torrent";
     pick.torrent = t;
@@ -595,9 +692,8 @@ async function torrentPick(url) {
   } finally {
     if (id === probeId) {
       probeId = 0;
-      logEl.hidden = true;
       fetchBtn.classList.remove("busy");
-      fetchBtn.textContent = "Fetch";
+      fetchBtn.textContent = "Find download";
     }
   }
 }
@@ -698,7 +794,7 @@ form.link.addEventListener("paste", () => setTimeout(() => /^(https?:\/\/|magnet
 
 function enqueue(...its) {
   for (const it of its) {
-    Object.assign(it, { id: nextId++, status: "queued", progress: 0, p: null });
+    Object.assign(it, { id: nextId++, status: "queued", progress: 0, p: null, dir: it.dir ?? dir });
     items.push(it);
     batch++;
   }
@@ -711,14 +807,15 @@ function enqueue(...its) {
 const stamp = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${d.toTimeString().slice(0, 8).replaceAll(":", "-")}`;
 
 async function pump() {
+  if (toolsBusy) return;
   // live recordings run alongside the one-at-a-time queue
   const busy = items.some((i) => i.status === "active" && !i.live);
   const it = items.find((i) => i.status === "queued" && (i.live || !busy));
   if (!it) return;
-  Object.assign(it, { status: "active", p: null });
+  Object.assign(it, { status: "active", p: null, engine: it.tool ?? "yt-dlp", started: Date.now() });
   pump();
   try {
-    await invoke("download", { id: it.id, url: it.url, dir: it.dir ?? dir, proxy: proxy(), opts: it.opts, tool: it.tool ?? "yt-dlp", fast: $("#fast").checked, files: it.files ?? null,
+    await invoke("download", { id: it.id, url: it.url, dir: it.dir ?? dir, proxy: proxy(), aria2Options: aria2Options(), opts: it.opts, tool: it.tool ?? "yt-dlp", fast: $("#fast").checked, files: it.files ?? null,
       quality: it.quality ?? null, name: it.live ? `${it.author} ${stamp()}` : null, minutes: it.minutes ?? null });
   } catch (e) {
     fail(it, e);
@@ -747,18 +844,26 @@ async function notify(title, body) {
   } catch {} // notifications are a nicety; never break the queue over them
 }
 
+function itemBadges(it) {
+  const format = it.container ?? it.path?.match(/\.([a-z0-9]{2,5})$/i)?.[1];
+  const values = [...(it.label ?? "").split(/\s*·\s*/), format?.toUpperCase(), it.size != null ? mb(it.size) : ""];
+  const engine = it.engine ?? it.tool;
+  return [...new Set(values.filter(Boolean))].map((value) => `<span class="file-badge">${esc(value)}</span>`).join("") +
+    (engine ? `<span class="file-badge engine-tag">${esc(engine)}</span>` : "");
+}
 function metaOf(it) {
   if (it.status === "failed") return [esc(String(it.error).split("\n")[0])];
-  if (it.status === "queued") return [esc(it.label), it.progress ? `${Math.floor(it.progress)}% · Queued` : "Queued"];
-  if (it.status === "paused") return [esc(it.label), `${Math.floor(it.progress)}% · Paused`];
+  if (it.status === "queued") return [it.progress ? `${Math.floor(it.progress)}% · Queued` : "Queued"];
+  if (it.status === "paused") return [`${Math.floor(it.progress)}% · Paused`];
   const p = it.p;
-  if (!p) return [esc(it.label), "Starting…"];
-  if (p.live) return [esc(it.label), `LIVE ● ${dur(p.elapsed)}`, mb(p.downloaded_bytes), it.minutes && `stops at ${it.minutes} min`];
-  if (p.files_done) return [esc(it.label), `${p.files_done} of ${plural(it.count, "file")}`];
+  if (!p) return ["Starting…"];
+  if (p.message) return [esc(p.message)];
+  if (p.live) return [`LIVE ● ${dur(p.elapsed)}`, mb(p.downloaded_bytes), it.minutes && `stops at ${it.minutes} min`];
+  if (p.files_done) return [`${p.files_done} of ${plural(it.count, "file")}`];
   const total = p.total_bytes ?? p.total_bytes_estimate;
   // torrents: "Seeds 12 · Peers 40 · ↑ 0.1 MB/s · ratio 0.1"
   const swarm = p.seeds != null && [`Seeds ${p.seeds}`, `Peers ${p.peers ?? 0}`, p.up && `↑ ${mb(p.up)}/s`, p.ratio != null && `ratio ${p.ratio.toFixed(1)}`];
-  return [esc(it.label), total && mb(total), p.speed && `${mb(p.speed)}/s`, p.eta != null && eta(p.eta), ...(swarm || [])];
+  return [p.downloaded_bytes != null && `${mb(p.downloaded_bytes)}${total ? ` / ${mb(total)}` : ""}`, p.speed && `${mb(p.speed)}/s`, p.eta != null && eta(p.eta), ...(swarm || [])];
 }
 
 function rowEl(it) {
@@ -767,7 +872,7 @@ function rowEl(it) {
     (it.status === "failed" ? btn("retry", "Try again", ICON.retry) + btn("dismiss", "Dismiss", ICON.stop)
       : (active && !it.live ? btn("pause", "Pause", ICON.pause) : it.status === "paused" ? btn("resume", "Resume", ICON.play) : "") +
         btn("stop", it.live && active ? "Stop recording" : active ? "Stop download" : "Remove from queue", ICON.stop)) + "</span>";
-  const li = row("li", `item ${it.status}`, it.thumb, it.title, metaOf(it), right, active ? '<span class="tube"></span>' : "");
+  const li = row("li", `item ${it.status}`, it.thumb, it.title, metaOf(it), right, `<span class="item-badges">${itemBadges(it)}</span>${active ? '<span class="tube"></span>' : ""}`);
   li.dataset.id = it.id;
   if (it.status === "failed") li.querySelector(".meta").title = it.error;
   li.style.setProperty("--p", `${it.progress}%`);
@@ -817,21 +922,28 @@ function renderQueue() {
   queue.replaceChildren(...items.map(rowEl));
   $("#downloads").hidden = !items.length;
   renderStatus();
+  renderHistory();
 }
 
 let savedTimer;
 listen("dl", ({ payload: ev }) => {
   const it = items.find((i) => i.id === ev.id);
   if (!it) return;
+  if (ev.kind === "engine") {
+    it.engine = ev.engine;
+    return renderQueue();
+  }
   if (ev.kind === "info") {
     Object.assign(it, { title: ev.info.title ?? it.title, thumb: ev.info.thumbnail ?? it.thumb });
     return renderQueue();
   }
   if (ev.kind === "progress") {
     const p = (it.p = ev.p);
+    if (p.engine) it.engine = p.engine;
     const total = p.total_bytes ?? p.total_bytes_estimate;
     // shortcut: video+audio downloads report two passes, so the bar refills once; weight the passes if it bothers anyone
-    if (total) it.progress = Math.min(100, (p.downloaded_bytes / total) * 100);
+    if (p.percent != null) it.progress = p.percent;
+    else if (total) it.progress = Math.min(100, (p.downloaded_bytes / total) * 100);
     // galleries count files, against the number the preview found
     if (p.files_done) it.progress = Math.min(100, (p.files_done / it.count) * 100);
     if (p.live) it.size = p.downloaded_bytes;
@@ -840,6 +952,7 @@ listen("dl", ({ payload: ev }) => {
       li.style.setProperty("--p", `${it.progress}%`);
       li.querySelector(".percent").textContent = it.live ? "" : `${Math.floor(it.progress)}%`;
       li.querySelector(".meta").innerHTML = metaHtml(metaOf(it));
+      li.querySelector(".item-badges").innerHTML = itemBadges(it);
     }
     return renderStatus();
   }
@@ -854,7 +967,7 @@ listen("dl", ({ payload: ev }) => {
       saved = { title: it.title, path: ev.path };
       clearTimeout(savedTimer);
       savedTimer = setTimeout(() => { saved = null; renderStatus(); }, 6000);
-      history.unshift({ title: it.title, thumb: it.thumb, path: ev.path, label: it.label, size: it.size, at: Date.now(), warnings: ev.warnings });
+      history.unshift({ title: it.title, thumb: it.thumb, path: ev.path, label: it.label, size: ev.size ?? it.size, estimated: ev.size == null, at: Date.now(), warnings: ev.warnings, url: it.url, tool: it.tool ?? "yt-dlp", engine: it.engine, elapsed: it.started ? Date.now() - it.started : null, container: it.opts?.audio ? it.opts.convert || null : it.opts?.container });
       saveHistory();
       notify("Download finished", it.title);
     }
@@ -896,23 +1009,27 @@ function saveHistory() {
 }
 
 const histEl = (h, i) => {
-  const li = row("li", "item done", h.thumb, h.title, [`${ICON.check} ${esc(h.label ?? "")}`, h.size && mb(h.size), when(h.at), h.warnings?.length && `<span class="warn" title="${esc(h.warnings.join("\n"))}">${h.warnings.length} warning${h.warnings.length > 1 ? "s" : ""}</span>`],
-    `<span class="actions">${btn("open", "Open", ICON.play)}${btn("reveal", finder, ICON.folder)}${btn("remove", "Remove from history", ICON.stop)}</span>`);
-  li.dataset.i = i;
-  li.tabIndex = 0;
-  return li;
+  const actions = `<span class="actions">${btn("open", "Open", ICON.play)}${btn("reveal", finder, ICON.folder)}${btn("remove", "Remove from history", ICON.stop)}</span>`;
+  const li = row("li", "item done", h.thumb, h.title, [esc(h.label ?? ""), h.size && mb(h.size), when(h.at)], actions);
+  const el = document.createElement("tr");
+  el.className = "saved-row";
+  el.innerHTML = `<td><div class="file-cell"></div></td><td><div class="item-badges">${itemBadges(h)}${h.warnings?.length ? `<span class="file-badge warning-badge" title="${esc(h.warnings.join("\n"))}">${h.warnings.length} warning${h.warnings.length > 1 ? "s" : ""}</span>` : ""}</div></td><td class="saved-column nums"><time title="${esc(new Date(h.at).toLocaleString("en"))}">${when(h.at)}</time></td><td>${actions}</td>`;
+  const name = li.querySelector(".name");
+  name.title = [h.title, h.path].filter(Boolean).join("\n");
+  el.querySelector(".file-cell").append(li.querySelector(".thumb-img"), name);
+  el.dataset.i = i;
+  el.tabIndex = 0;
+  return el;
 };
 
 function renderHistory() {
+  $("#library-count").textContent = history.length || "";
   const q = $("#search").value.trim().toLowerCase();
   const list = $("#history");
-  const shown = history.map(histEl).filter((li, i) => !q || history[i].title.toLowerCase().includes(q));
+  const shown = history.map(histEl).filter((li, i) => !q || [history[i].title, history[i].path, history[i].url, history[i].label].some((v) => v?.toLowerCase().includes(q)));
   list.replaceChildren(...shown);
-  if (!shown.length) list.innerHTML = `<li class="empty">${q ? "No matches" : "Nothing downloaded yet"}</li>`;
+  if (!shown.length) list.innerHTML = `<tr><td colspan="4" class="empty">${q ? "No matching downloads" : "Your saved downloads will appear here"}</td></tr>`;
   $("#clear").hidden = $("#search").hidden = !history.length;
-  $("#recent-list").replaceChildren(...history.slice(0, 3).map(histEl));
-  $("#recent").hidden = !history.length || !pick.hidden;
-  $("#hint").hidden = !!history.length || !pick.hidden;
 }
 
 // file may have been moved or deleted since; nothing useful to do then
@@ -929,7 +1046,7 @@ function onHistory(e) {
   if (act === "reveal") reveal(h.path);
   if (act === "remove") { history.splice(li.dataset.i, 1); saveHistory(); }
 }
-for (const l of [$("#history"), $("#recent-list")]) for (const t of ["click", "dblclick", "keydown"]) l.addEventListener(t, onHistory);
+for (const t of ["click", "dblclick", "keydown"]) $("#history").addEventListener(t, onHistory);
 $("#search").addEventListener("input", renderHistory);
 $("#clear").addEventListener("click", () => { history = []; saveHistory(); });
 
@@ -961,7 +1078,7 @@ pickBrowser(browser);
 const showCookies = async (on) => {
   $("#cookie-remove").hidden = !on;
   $("#cookie-sites-box").hidden = true;
-  cookieStatus.textContent = on ? store("cookieNote") || "Imported; import again when sign-in expires" : "Import your browser's cookies to download from YouTube, Instagram, X and more as you, signed in";
+  cookieStatus.textContent = on ? store("cookieNote") || "Imported; import again when sign-in expires" : "Import a signed-in browser session for sites that require it";
   if (!on) return;
   // the sites in the cookies that yt-dlp can download from
   const sites = await invoke("cookie_sites").catch(() => []);
@@ -1022,16 +1139,12 @@ $("#dir-btn").addEventListener("click", async () => {
 
 // yt-dlp: the app's own standalone copy updates itself; a system one (pip, Homebrew…) can be swapped for it
 const status = $("#status");
-const useBuiltin = $("#use-builtin");
 let ytdlp = {};
 async function refreshYtdlp(note) {
   ytdlp = await invoke("ytdlp_info").catch(() => ({}));
   showCookies(ytdlp.cookies);
-  $("#ytdlp-ver").textContent = ytdlp.version ? `yt-dlp ${ytdlp.version}` : "yt-dlp not found";
-  status.textContent = note ?? (ytdlp.managed ? "Built-in, updates itself" : ytdlp.version ? "System install (pip, Homebrew…); the app can't update it" : "Install it to start downloading");
-  $("#check").hidden = !ytdlp.managed;
-  useBuiltin.hidden = ytdlp.managed;
-  useBuiltin.textContent = ytdlp.version ? "Use built-in yt-dlp" : "Install yt-dlp";
+  status.textContent = note ?? (ytdlp.managed ? "" : ytdlp.version ? "System install (pip, Homebrew…); the app can't update it" : "Install it to start downloading");
+  if (ytdlp.version) toolVersions["yt-dlp"] = ytdlp.version;
 }
 async function busy(b, label, work) {
   const text = b.textContent;
@@ -1040,50 +1153,108 @@ async function busy(b, label, work) {
   try { await work(); } finally { b.disabled = false; b.textContent = text; }
 }
 async function checkUpdates() {
+  if (items.some((i) => i.status === "active")) { status.textContent = "Wait for downloads to finish, then update."; return; }
   status.textContent = "Checking for updates…";
   const note = await invoke("update_ytdlp").catch(String);
   await refreshYtdlp(note);
+  renderTools();
 }
-$("#check").addEventListener("click", () => busy($("#check"), "Checking…", checkUpdates));
-useBuiltin.addEventListener("click", () => busy(useBuiltin, "Downloading…", async () => {
-  status.textContent = "Downloading the standalone yt-dlp…";
-  const note = await invoke("install_ytdlp").catch(String);
-  await refreshYtdlp(note);
-}));
+const ARIA_FIELDS = {
+  connections: ["Connections per server", "1–16 · default 16", 16, 1, 16, "", "How many connections one server can receive for a file. Higher values may improve speed, but some servers limit connections. Start with 4–8 if downloads keep failing."],
+  splits: ["Parts per file", "1–128 · default 16", 16, 1, 128, "parts", "Downloads a file in several parts at once. The server connection limit and minimum part size can reduce the actual number used."],
+  min_split_mib: ["Minimum part size", "1–1024 · default 1", 1, 1, 1024, "MiB", "A file must be at least twice this size before aria2 splits it. A larger value uses fewer connections for small files."],
+  download_kib: ["Download limit", "0 means unlimited", 0, 0, 1000000, "KiB/s", "Caps each download’s speed. For example, 1024 KiB/s is about 1 MiB/s. Use a limit to leave bandwidth for other apps."],
+  upload_kib: ["Torrent upload limit", "0 means unlimited", 0, 0, 1000000, "KiB/s", "Caps torrent upload speed while downloading. For example, 256 limits uploads to 256 KiB/s. Seeding stops when the download finishes."],
+  timeout: ["No-data timeout", "1–600 · default 60", 60, 1, 600, "sec", "Retries a connection after this many seconds without receiving data. Increase it on slow or unreliable connections."],
+  connect_timeout: ["Connection timeout", "1–600 · default 60", 60, 1, 600, "sec", "How long to wait when connecting to a server before treating the connection attempt as failed."],
+  retries: ["Maximum attempts", "0 means keep trying", 5, 0, 100, "tries", "How many times aria2 tries a failed download. Use 0 for unlimited attempts; a finite value prevents repeated retries from running forever."],
+  retry_wait: ["Pause between retries", "0–300 · default 0", 0, 0, 300, "sec", "Waits before trying again after a failure. A short pause can help when a server is busy or rate-limiting requests."],
+  peers: ["Torrent peer limit", "0 means unlimited", 55, 0, 1000, "peers", "Maximum connected peers for each torrent. More peers can use more network and CPU resources. The default is 55."],
+};
+function renderAriaSettings(saved = load("aria2") ?? {}) {
+  const field = (key) => {
+    const [label, hint, fallback, min, max, unit, help] = ARIA_FIELDS[key];
+    const value = Number.isInteger(saved[key]) && saved[key] >= min && saved[key] <= max ? saved[key] : fallback;
+    return `<div class="aria-field"><div class="aria-field-copy"><div class="aria-label"><label for="aria-${key}">${label}</label><span class="tool-help aria-help" tabindex="0" aria-label="About ${label}" aria-describedby="hint-${key}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/></svg><span class="tool-tip" id="hint-${key}" role="tooltip">${esc(help)}</span></span></div><small id="range-${key}">${hint}</small></div><span class="aria-value"><input id="aria-${key}" name="${key}" type="number" min="${min}" max="${max}" step="1" value="${value}" aria-describedby="range-${key} hint-${key}" required />${unit ? `<span>${unit}</span>` : ""}</span></div>`;
+  };
+  const allocation = `<div class="aria-field"><div class="aria-field-copy"><label for="aria-allocation">Disk space</label><small>When to reserve file space</small></div><select id="aria-allocation" name="allocation" title="On demand grows the file as it downloads. Preallocate reserves its full size first. Truncate sets its length without filling it."><option value="none">On demand</option><option value="prealloc">Reserve first</option><option value="trunc">Set file size</option></select></div>`;
+  $("#aria-fields").innerHTML = [
+    ["Connections", "How files are split and downloaded", ["connections", "splits", "min_split_mib"]],
+    ["Bandwidth", "Leave room for your other apps", ["download_kib", "upload_kib"]],
+    ["Retries & timeouts", "Handle slow or interrupted connections", ["connect_timeout", "timeout", "retries", "retry_wait"]],
+    ["Torrents & storage", "Peer connections and disk space", ["peers"]],
+  ].map(([title, description, keys], i) => `<section class="aria-group card" aria-label="${title}"><header><h3>${title}</h3><p>${description}</p></header>${keys.map(field).join("")}${i === 3 ? allocation : ""}</section>`).join("");
+  $("#aria-allocation").value = ["none", "prealloc", "trunc"].includes(saved.allocation) ? saved.allocation : "none";
+}
+function aria2Options() {
+  const form = $("#aria-settings");
+  if (!form.checkValidity()) throw "Check the aria2c settings: a value is outside its allowed range.";
+  return { ...Object.fromEntries(Object.keys(ARIA_FIELDS).map((key) => [key, Number(form.elements[key].value)])), allocation: form.elements.allocation.value };
+}
+renderAriaSettings();
+$("#aria-settings").addEventListener("submit", (e) => e.preventDefault());
+$("#aria-settings").addEventListener("input", () => {
+  const valid = $("#aria-settings").checkValidity();
+  $("#aria-error").hidden = valid;
+  $("#aria-error").textContent = "Enter a whole number within the range shown.";
+  if (valid) store("aria2", JSON.stringify(aria2Options()));
+});
+$("#aria-reset").addEventListener("click", () => { renderAriaSettings({}); $("#aria-error").hidden = true; store("aria2", JSON.stringify(aria2Options())); });
 
-// ffmpeg, deno and aria2c versions, plus a row per Python tool; "Update all" also runs the yt-dlp check
+// Versions and explicit install/update controls for every managed tool.
 const fastEl = $("#fast");
 fastEl.checked = store("fast") !== "0";
 fastEl.addEventListener("change", () => store("fast", fastEl.checked ? "1" : "0"));
-const UV_TOOLS = { "gallery-dl": "Images from Instagram, Pixiv, DeviantArt, Imgur, Reddit, Tumblr, X", streamlink: "Records live streams from Twitch, Kick and YouTube" };
-const uvRows = Object.entries(UV_TOOLS).map(([name, what]) => {
-  const el = document.createElement("div");
-  el.className = "setting";
-  el.innerHTML = `<span><span class="nums"></span><small></small></span><button class="btn" type="button" hidden>Remove</button>`;
-  el.querySelector("small").textContent = what;
-  el.querySelector("button").addEventListener("click", () => busy(el.querySelector("button"), "Removing…", async () => {
-    if (items.some((i) => i.status === "active" && i.tool === name)) return (el.querySelector("small").textContent = "Wait for its downloads to finish.");
-    await invoke("remove_tool", { name }).catch((e) => (el.querySelector("small").textContent = String(e)));
-    await refreshTools();
-  }));
-  return [name, el];
-});
-fastEl.closest(".setting").before(...uvRows.map(([, el]) => el));
-async function refreshTools() {
-  const v = await invoke("tool_versions").catch(() => ({}));
-  $("#tools-ver").textContent = ["ffmpeg", "deno", "aria2c"].map((n) => `${n} ${v[n] ?? "missing"}`).join(" · ");
-  for (const [name, el] of uvRows) {
-    el.querySelector(".nums").textContent = v[name] ? `${name} ${v[name]}` : `${name} · installs on first use`;
-    el.querySelector("button").hidden = !v[name];
-  }
+const TOOLS = {
+  "yt-dlp": ["Finds available video/audio qualities and downloads from supported websites. Used for video pages, playlists and music.", "yt-dlp/yt-dlp", '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/>', "Video / audio"],
+  ffmpeg: ["Combines separate video and audio tracks, converts formats and embeds subtitles. Needed for most high-quality video downloads.", "FFmpeg/FFmpeg", '<path d="m13 3-8 10h6l-1 8 9-11h-7z"/>', "Merge / convert"],
+  ffprobe: ["Reads duration, codecs and other media information so media processing can identify the downloaded tracks. Installed with ffmpeg.", "FFmpeg/FFmpeg", '<circle cx="10" cy="10" r="6"/><path d="m15 15 6 6M8 10h4m-2-2v4"/>', "Media info"],
+  deno: ["Runs JavaScript challenges used by some video sites, including YouTube. Needed when extraction requires a JavaScript runtime.", "denoland/deno", '<path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18"/>', "Site access"],
+  aria2c: ["Downloads direct file URLs, magnet links and torrent files. Also accelerates compatible video downloads with multiple connections. This app uses a pinned build.", "aria2/aria2", '<path d="M5 4v12m-3-3 3 3 3-3M12 4v16m-3-3 3 3 3-3M19 4v12m-3-3 3 3 3-3"/>', "Files / torrents"],
+  "gallery-dl": ["Downloads images and galleries from supported art and photo sites. Optional unless you download galleries.", "mikf/gallery-dl", '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="1"/><path d="m3 17 5-5 4 4 4-7 5 8"/>', "Images"],
+  streamlink: ["Records supported live broadcasts, such as Twitch and Kick. Optional unless you record live streams.", "streamlink/streamlink", '<circle cx="12" cy="12" r="2"/><path d="M7 7a7 7 0 0 0 0 10M17 7a7 7 0 0 1 0 10M4 4a11 11 0 0 0 0 16M20 4a11 11 0 0 1 0 16"/>', "Live recording"],
+  "N_m3u8DL-RE": ["Downloads unencrypted HLS (.m3u8) and DASH (.mpd) streams. Optional for direct stream manifests. This app uses a pinned build.", "nilaoda/N_m3u8DL-RE", '<path d="M3 6h12M3 12h8M3 18h8m6-10v12m-4-4 4 4 4-4"/>', "HLS / DASH"],
+  uv: ["Installs gallery-dl and Streamlink with a managed Python runtime. Needed to install or update those two tools.", "astral-sh/uv", '<path d="m12 2 9 5v10l-9 5-9-5V7zM3 7l9 5 9-5m-9 5v10M7 4l9 5"/>', "Python setup"],
+};
+let toolVersions = {};
+function renderTools() {
+  $("#tools-update").disabled = toolsBusy;
+  $("#tools-list").innerHTML = Object.entries(TOOLS).map(([name, [description, repo, icon, purpose]]) => `<tr><th scope="row"><div class="tool-identity"><span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 24 24">${icon}</svg></span><a href="https://github.com/${repo}" class="tool-repo" title="${esc(description)} · github.com/${repo}" aria-label="${esc(name)} repository">${esc(name)}<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg></a></div></th><td class="nums" title="${esc(toolVersions[name] ?? "")}">${toolVersion(toolVersions[name])}</td><td><span class="tool-help" tabindex="0" aria-describedby="why-${name}">${purpose}<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/></svg><span class="tool-tip" id="why-${name}" role="tooltip">${esc(description)}</span></span></td><td><button class="btn" type="button" data-tool="${name}" ${toolsBusy ? "disabled" : ""}>${toolVersions[name] ? "Update" : "Download"}</button>${toolVersions[name] && ["gallery-dl", "streamlink", "N_m3u8DL-RE"].includes(name) ? `<button class="link-btn danger" type="button" data-remove-tool="${name}" ${toolsBusy ? "disabled" : ""}>Remove</button>` : ""}</td></tr>`).join("");
 }
-$("#tools-update").addEventListener("click", () => busy($("#tools-update"), "Updating…", async () => {
-  // a running download holds ffmpeg and yt-dlp open; Windows can't replace them then
-  if (items.some((i) => i.status === "active")) return ($("#tools-status").textContent = "Wait for downloads to finish, then update.");
-  $("#tools-status").textContent = "Downloading the latest yt-dlp, ffmpeg and deno…";
-  $("#tools-status").textContent = await invoke("update_tools", { proxy: proxy() }).catch(String);
-  await Promise.all([refreshTools(), refreshYtdlp()]);
-}));
+async function refreshTools() {
+  toolVersions = await invoke("tool_versions").catch(() => ({}));
+  if (ytdlp.version) toolVersions["yt-dlp"] = ytdlp.version;
+  renderTools();
+}
+async function prepareTools(names, remove = false) {
+  if (toolsBusy) return;
+  if (items.some((i) => i.status === "active") || fetchBtn.classList.contains("busy") || pl?.loading) {
+    $("#tools-status").textContent = "Wait for downloads and link checks to finish, then update.";
+    return;
+  }
+  toolsBusy = true;
+  renderTools();
+  const errors = [];
+  try {
+    for (const name of names) {
+      $("#tools-status").textContent = `${remove ? "Removing" : "Downloading / updating"} ${name}…`;
+      try { await invoke(remove ? "remove_tool" : "install_tool", { name, proxy: proxy() }); }
+      catch (e) { errors.push(`${name}: ${e}`); }
+    }
+    await refreshYtdlp();
+    await refreshTools();
+    siteNames = [];
+    $("#tools-status").textContent = errors.length ? errors.join(" · ") : remove ? "Tool removed. You can download it again at any time." : "All requested tools are ready.";
+  } finally { toolsBusy = false; renderTools(); pump(); }
+}
+$("#tools-list").addEventListener("click", (e) => {
+  const repo = e.target.closest(".tool-repo");
+  if (repo) { e.preventDefault(); opener.openUrl(repo.href).catch(() => {}); return; }
+  const name = e.target.closest("[data-tool]")?.dataset.tool;
+  const removed = e.target.closest("[data-remove-tool]")?.dataset.removeTool;
+  if (name || removed) prepareTools([name || removed], !!removed);
+});
+$("#tools-update").addEventListener("click", () => prepareTools(Object.keys(TOOLS).filter((n) => n !== "ffprobe")));
 
 function showProxy() {
   $("#proxy-fields").hidden = $("#proxy-test").hidden = !pf("type").value;
@@ -1107,29 +1278,52 @@ for (const k of PROXY_KEYS) {
   pf(k).value = savedProxy[k] ?? "";
   pf(k).addEventListener("change", () => {
     store("proxy", JSON.stringify(Object.fromEntries(PROXY_KEYS.map((k) => [k, pf(k).value.trim()]))));
+    thumbnails.clear();
     showProxy();
+    renderHistory();
+    renderQueue();
   });
 }
 showProxy();
 
-// Supported sites: yt-dlp's extractor list, one row per site (youtube:tab etc. fold into youtube)
+// One directory, merging each site's capabilities instead of separate nested lists.
 const sites = $("#sites");
-let siteNames = [];
+let siteNames = [], siteFilter = "all";
+const SITE_TYPES = { all: "All", media: "Video & audio", images: "Images", live: "Live", files: "Files & torrents" };
 function renderSites() {
   const q = $("#sites-search").value.trim().toLowerCase();
-  const shown = siteNames.filter((n) => n.toLowerCase().includes(q));
-  $("#sites-count").textContent = shown.length;
-  $("#sites-list").replaceChildren(...shown.map((n) => Object.assign(document.createElement("li"), { textContent: n })));
+  const sources = supportedSources(siteNames);
+  const shown = sources.filter((source) => (siteFilter === "all" || source.types.includes(siteFilter)) &&
+    (!q || [source.name, source.detail, ...source.tools, ...source.types.map((type) => SITE_TYPES[type])].join(" ").toLowerCase().includes(q)));
+  $("#sites-filters").innerHTML = Object.entries(SITE_TYPES).map(([key, label]) => `<button type="button" data-filter="${key}" aria-pressed="${siteFilter === key}">${label}</button>`).join("");
+  $("#sites-count").textContent = `${shown.length.toLocaleString("en")} ${shown.length === 1 ? "source" : "sources"}${q || siteFilter !== "all" ? ` of ${sources.length.toLocaleString("en")}` : ""}`;
+  $("#sites-list").innerHTML = shown.length ? shown.map((source) => `<li class="site-row"><span class="site-monogram" aria-hidden="true">${esc(source.name[0].toUpperCase())}</span><div class="site-copy"><b>${esc(source.name)}</b>${source.detail ? `<small>${esc(source.detail)}</small>` : ""}<span class="site-kinds">${source.types.map((type) => `<span>${SITE_TYPES[type]}</span>`).join("")}</span></div><span class="site-tools">${source.tools.map((tool) => `<span class="file-badge">${esc(tool)}</span>`).join("")}</span></li>`).join("") : '<li class="sites-empty"><b>No matching sources</b><span>Try a different site name, tool or category.</span></li>';
+  $("#sites-list").scrollTop = 0;
 }
 $("#sites-btn").addEventListener("click", () => busy($("#sites-btn"), "Loading…", async () => {
-  if (!siteNames.length) {
-    const list = await invoke("list_sites").catch((e) => { status.textContent = String(e); });
-    if (!list) return;
-    siteNames = [...new Set(list.map((n) => n.split(":")[0]).filter((n) => n && n !== "generic" && !n.includes("BROKEN")))].sort((a, b) => a.localeCompare(b));
-  }
+  siteFilter = "all";
+  $("#sites-search").value = "";
+  $("#sites-status").textContent = siteNames.length ? "" : "Loading video sites…";
   renderSites();
   sites.showModal();
+  $("#sites-search").focus();
+  if (!siteNames.length) {
+    try { siteNames = await invoke("list_sites"); $("#sites-status").textContent = ""; }
+    catch { $("#sites-status").textContent = "Video catalog unavailable. Reopen to retry."; }
+    renderSites();
+  }
 }));
+$("#sites-filters").addEventListener("click", (e) => {
+  const button = e.target.closest("[data-filter]");
+  if (!button) return;
+  siteFilter = button.dataset.filter;
+  renderSites();
+  $("#sites-filters").querySelector(`[data-filter="${siteFilter}"]`).focus();
+});
+sites.addEventListener("click", (e) => {
+  const url = e.target.closest("[data-docs]")?.dataset.docs;
+  if (url) opener.openUrl(url).catch(() => {});
+});
 $("#sites-search").addEventListener("input", renderSites);
 $("#sites-close").addEventListener("click", () => sites.close());
 
@@ -1155,11 +1349,12 @@ showDir();
 renderHistory();
 renderQueue();
 // first launch downloads yt-dlp, ffmpeg, deno and aria2c; later launches return at once
+renderTools();
 status.textContent = "Getting yt-dlp, ffmpeg, deno and aria2c…";
-invoke("install_tools").then(() => refreshYtdlp().then(() => ytdlp.managed && checkUpdates()), (e) => refreshYtdlp(`Couldn't download tools: ${e}`)).finally(refreshTools);
+invoke("install_tools").then(() => refreshYtdlp().then(() => ytdlp.managed && checkUpdates()), (e) => refreshYtdlp(`Couldn't download tools: ${e}`)).finally(async () => { toolsBusy = false; await refreshTools(); });
 checkApp(true);
 // a window left open for days still picks up updates; yt-dlp can't replace itself while a download runs it
 setInterval(() => {
   checkApp(true);
-  if (ytdlp.managed && !items.some((i) => i.status === "active")) checkUpdates();
+  if (!toolsBusy && ytdlp.managed && !items.some((i) => i.status === "active")) checkUpdates();
 }, 864e5);

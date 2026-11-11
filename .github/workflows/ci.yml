@@ -23,5 +23,7 @@ jobs:
           cargo clippy --locked -- -D warnings
       - name: Frontend syntax
         run: node --check src/main.js
+      - name: Frontend tests
+        run: npm test
       - name: Scripts
         run: bash -n scripts/*.sh

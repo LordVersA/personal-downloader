@@ -91,10 +91,10 @@ Each phase ships as its own release.
 - [x] Download: each song is a normal yt-dlp queue item for `music.youtube.com/search?q=<artists title>#songs` with `-I 1` (the first song result, an official audio track with artist/album tags, not the music video). Only the Audio choices show (Convert, using the remembered Audio format, mp3 by default; or Original). Lists go into a subfolder named after the album or playlist, like yt-dlp playlists. *The match isn't checked against the Spotify duration.*
 
 ### Phase 6: HLS/DASH (N_m3u8DL-RE)
-- [ ] Fetch the release binary per OS.
-- [ ] Download: `--save-dir --save-name --auto-select`, the app's ffmpeg path, and the proxy. **Never** pass `--key` / `--key-text-file` / `--use-shaka-packager`.
-- [ ] If the manifest is DRM-encrypted (Widevine/PlayReady/FairPlay), stop and show "This stream is DRM-protected and can't be downloaded."
-- [ ] Parse its progress line → progress event.
+- [x] Fetch the release binary per OS. *On demand: official `v0.6.0-beta` archives for Windows, macOS and Linux (x64 / arm64), pinned SHA-256 digests. Settings → Tools shows its version, Remove and Update all (re-fetches the pinned release).*
+- [x] Download: `--save-dir --save-name --auto-select`, the app's ffmpeg path, and the proxy. **Never** pass `--key` / `--key-text-file` / `--use-shaka-packager`. *Auto routing and Advanced override use the filename + Download preview. Muxes to MP4 in a fresh folder to prevent overwrites; first-use installation reports in the queue. Failed downloads retry through yt-dlp only after another protection check. The pinned binary has no cookies.txt option.*
+- [x] If the manifest is DRM-encrypted (Widevine/PlayReady/FairPlay), stop and show "This stream is DRM-protected and can't be downloaded." *Checks the manifest and HLS child playlists through the app proxy before installation/download or fallback; unreadable manifests fail closed. Rejects all encryption signaling, including ordinary AES HLS, and disables HLS decryption in the downloader. Live HLS is directed to streamlink; live DASH and external XML references are rejected. Checks are bounded to 64 manifests, 4 MiB each, 20 seconds per request. Cancellation prevents a subsequent process from starting; an in-flight check/install may finish in the background.*
+- [x] Parse its progress line → progress event. *Percentage feeds the existing queue. Explicit terminal dimensions prevent Spectre.Console from crashing with piped output. Verified local clear HLS and DASH → playable MP4 on macOS arm64; unit tests cover routing, encryption, nested playlists and progress. Windows/Linux execution remains untested.*
 
 ## Risks & guardrails
 - **DRM:** no decryption, by any tool, ever (legal reasons: DMCA §1201 / EU InfoSoc Art. 6).
